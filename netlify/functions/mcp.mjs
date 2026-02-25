@@ -40,7 +40,10 @@ async function handlePost(request) {
     });
 
     const headers = new Headers(queuedRequest.headers);
-    if (!headers.has("accept")) {
+    const accept = headers.get("accept") || "";
+    const hasJson = accept.includes("application/json");
+    const hasEventStream = accept.includes("text/event-stream");
+    if (!hasJson || !hasEventStream) {
       headers.set("accept", "application/json, text/event-stream");
     }
     const mcpRequest = new Request(queuedRequest, { headers });
