@@ -1,3 +1,4 @@
+[![Netlify Status](https://api.netlify.com/api/v1/badges/976e5c64-8ce7-42a5-a195-0076cb9296e1/deploy-status)](https://app.netlify.com/projects/lovely-nasturtium-97f019/deploys)
 # CKAN MCP on Netlify
 
 Deploys a vendored CKAN MCP server as a Netlify Function at `/mcp` for ChatGPT connectors.
