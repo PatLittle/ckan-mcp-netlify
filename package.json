@@ -1,0 +1,9 @@
+{
+  "name": "ckan-mcp-netlify",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@aborruso/ckan-mcp-server": "^0.4.41",
+    "@modelcontextprotocol/sdk": "^1.6.0"
+  }
+}
