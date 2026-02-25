@@ -1,6 +1,11 @@
 [build]
-  command = "npm install"
+  command = "npm ci"
   publish = "."
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  external_node_modules = ["@aborruso/ckan-mcp-server", "@modelcontextprotocol/sdk"]
 
 [[redirects]]
   from = "/mcp"
