@@ -1,9 +1,15 @@
 {
   "name": "ckan-mcp-netlify",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "dependencies": {
-    "@aborruso/ckan-mcp-server": "^0.4.41",
-    "@modelcontextprotocol/sdk": "^1.6.0"
+    "@modelcontextprotocol/ext-apps": "^1.0.1",
+    "@modelcontextprotocol/sdk": "^1.25.2",
+    "axios": "^1.7.2",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }

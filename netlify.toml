@@ -5,6 +5,7 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "zisi"
+  included_files = ["vendor/ckan-mcp/**"]
 
 [[redirects]]
   from = "/mcp"
