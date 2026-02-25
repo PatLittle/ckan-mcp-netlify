@@ -1,4 +1,4 @@
-import { createServer, registerAll } from "@aborruso/ckan-mcp-server/dist/server.js";
+import { createServer, registerAll } from "@aborruso/ckan-mcp-server";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Readable } from "node:stream";
 
