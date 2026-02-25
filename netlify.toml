@@ -1,0 +1,8 @@
+[build]
+  command = "npm install"
+  publish = "."
+
+[[redirects]]
+  from = "/mcp"
+  to = "/.netlify/functions/mcp"
+  status = 200
