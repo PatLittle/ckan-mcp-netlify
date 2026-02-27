@@ -97,6 +97,8 @@ const DATASTORE_TABLE_HTML = `<!DOCTYPE html>
     tr:hover td { background: #fafafa; }
     tr:last-child td { border-bottom: none; }
     td.null-val { color: #bbb; font-style: italic; }
+    td a { color: #0066cc; text-decoration: none; }
+    td a:hover { text-decoration: underline; }
     .pagination {
       display: flex;
       align-items: center;
@@ -195,8 +197,19 @@ const DATASTORE_TABLE_HTML = `<!DOCTYPE html>
         });
       });
     }
+    function getRowLink(rec){
+      var raw=rec.__link_url||rec._link_url||rec.url||rec.dataset_url||rec.link;
+      if(raw===null||raw===undefined) return null;
+      var s=String(raw).trim();
+      if(!/^https?:\\/\\//i.test(s)) return null;
+      return s;
+    }
     function render(){
       var app=document.getElementById('app');
+      var _oldFilter=document.getElementById('filter');
+      var _saveFocused=!!(_oldFilter&&document.activeElement===_oldFilter);
+      var _saveSel=null;
+      if(_saveFocused&&_oldFilter){_saveSel=[_oldFilter.selectionStart,_oldFilter.selectionEnd];}
       filteredRecords=sortRecords(applyFilter(allRecords));
       var totalFiltered=filteredRecords.length;
       var totalPages=Math.ceil(totalFiltered/pageSize)||1;
@@ -222,25 +235,31 @@ const DATASTORE_TABLE_HTML = `<!DOCTYPE html>
       });
       html+='</select>';
       html+='<span class="count-info">'+countLabel+'</span></div>';
+      var visFields=fields.filter(function(f){return f.id!=='__link_url'&&f.id!=='_link_url';});
       html+='<div class="table-wrapper"><table><thead><tr>';
-      fields.forEach(function(f){
+      visFields.forEach(function(f){
         var cls=(sortCol===f.id)?(sortDir===1?' class="sort-asc"':' class="sort-desc"'):'';
         html+='<th'+cls+' data-col="'+escHtml(f.id)+'">'+escHtml(f.id)+'</th>';
       });
       html+='</tr></thead><tbody>';
       if(pageRecords.length===0){
-        html+='<tr><td colspan="'+fields.length+'" class="state-msg">No records found</td></tr>';
+        html+='<tr><td colspan="'+visFields.length+'" class="state-msg">No records found</td></tr>';
       } else {
         pageRecords.forEach(function(rec){
           html+='<tr>';
-          fields.forEach(function(f){
+          visFields.forEach(function(f){
             var v=rec[f.id];
             if(v===null||v===undefined){
               html+='<td class="null-val">\\u2014</td>';
             } else {
               var s=String(v);
               var display=s.length>80?s.slice(0,77)+'\\u2026':s;
-              html+='<td title="'+escHtml(s)+'">'+escHtml(display)+'</td>';
+              var link=(f.id==='title')?getRowLink(rec):null;
+              if(link){
+                html+='<td title="'+escHtml(s)+'"><a href="'+escHtml(link)+'" target="_blank" rel="noopener noreferrer">'+escHtml(display)+'</a></td>';
+              } else {
+                html+='<td title="'+escHtml(s)+'">'+escHtml(display)+'</td>';
+              }
             }
           });
           html+='</tr>';
@@ -265,10 +284,19 @@ const DATASTORE_TABLE_HTML = `<!DOCTYPE html>
       }
       app.innerHTML=html;
       bindEvents();
+      if(_saveFocused){
+        var nf=document.getElementById('filter');
+        if(nf){
+          nf.focus();
+          if(_saveSel)nf.setSelectionRange(_saveSel[0],_saveSel[1]);
+        }
+      }
     }
     function bindEvents(){
       var filterEl=document.getElementById('filter');
-      if(filterEl) filterEl.addEventListener('input',function(e){ filterText=e.target.value; currentPage=1; render(); });
+      if(filterEl){
+        filterEl.addEventListener('input',function(e){ filterText=e.target.value; currentPage=1; render(); });
+      }
       var pageSzEl=document.getElementById('pageSz');
       if(pageSzEl) pageSzEl.addEventListener('change',function(e){ pageSize=parseInt(e.target.value,10); currentPage=1; render(); });
       document.querySelectorAll('th[data-col]').forEach(function(th){

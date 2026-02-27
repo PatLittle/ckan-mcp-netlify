@@ -1,4 +1,4 @@
-import portalsConfig from "../portals.json" with { type: "json" };
+import portalsConfig from '../portals.json' with { type: "json" };
 import { getPortalConfig, normalizePortalUrl } from './portal-config.js';
 /**
  * Generate the view URL for a dataset

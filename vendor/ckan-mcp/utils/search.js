@@ -43,6 +43,27 @@ export function convertDateMathForUnsupportedFields(query) {
         return `${field}:[${startIso} TO ${nowIso}]`;
     });
 }
+const EXPLICIT_BOOL_PATTERN = /\b(AND|OR|NOT)\b|[+\-!]/;
+export function isPlainMultiTermQuery(query) {
+    const trimmed = query.trim();
+    if (trimmed === "*:*" || trimmed === "")
+        return false;
+    if (FIELD_QUERY_PATTERN.test(trimmed))
+        return false;
+    if (EXPLICIT_BOOL_PATTERN.test(trimmed))
+        return false;
+    const words = trimmed.split(/\s+/).filter(Boolean);
+    return words.length > 1;
+}
+export function buildOrQuery(query) {
+    return query.trim().split(/\s+/).filter(Boolean).join(" OR ");
+}
+export function stripAccents(text) {
+    return text.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+export function hasAccents(text) {
+    return text !== stripAccents(text);
+}
 export function resolveSearchQuery(serverUrl, query, parserOverride) {
     const portalSearchConfig = getPortalSearchConfig(serverUrl);
     const portalForce = portalSearchConfig.force_text_field ?? false;

@@ -4,11 +4,9 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, formatDate, addDemoFooter } from "../utils/formatting.js";
+import { truncateText, formatDate, formatBytes, addDemoFooter } from "../utils/formatting.js";
 import { getDatasetViewUrl } from "../utils/url-generator.js";
-import { resolveSearchQuery } from "../utils/search.js";
-import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import { DATASTORE_TABLE_RESOURCE_URI } from "../resources/datastore-table-ui.js";
+import { resolveSearchQuery, stripAccents, hasAccents, isPlainMultiTermQuery, buildOrQuery } from "../utils/search.js";
 const DEFAULT_RELEVANCE_WEIGHTS = {
     title: 4,
     notes: 2,
@@ -234,8 +232,14 @@ export const formatPackageShowMarkdown = (result, serverUrl) => {
             markdown += `- **Created**: ${formatDate(resource.created)}\n`;
             if (resource.last_modified)
                 markdown += `- **Modified**: ${formatDate(resource.last_modified)}\n`;
-            if (resource.datastore_active !== undefined) {
-                markdown += `- **DataStore**: ${resource.datastore_active ? '✅ Available' : '❌ Not available'}\n`;
+            if (resource.datastore_active === true) {
+                markdown += `- **DataStore**: ✅ Available\n`;
+            }
+            else if (resource.datastore_active === false) {
+                markdown += `- **DataStore**: ❌ Not available\n`;
+            }
+            else {
+                markdown += `- **DataStore**: ❓ Not reported by portal\n`;
             }
             markdown += '\n';
         }
@@ -249,11 +253,17 @@ export const formatPackageShowMarkdown = (result, serverUrl) => {
     }
     return markdown;
 };
+export function resolvePageParams(page, pageSize, start, rows) {
+    if (page !== undefined) {
+        return { effectiveStart: (page - 1) * pageSize, effectiveRows: pageSize };
+    }
+    return { effectiveStart: start, effectiveRows: rows };
+}
 export function registerPackageTools(server) {
     /**
      * Search for datasets on a CKAN server
      */
-    registerAppTool(server, "ckan_package_search", {
+    server.registerTool("ckan_package_search", {
         title: "Search CKAN Datasets",
         description: `Search for datasets (packages) on a CKAN server using Solr query syntax.
 
@@ -289,6 +299,8 @@ Args:
   - fq (string): Filter query (e.g., "organization:comune-palermo")
   - rows (number): Number of results to return (default: 10, max: 1000)
   - start (number): Offset for pagination (default: 0)
+  - page (number): Page number (1-based); alias for start. Overrides start if provided.
+  - page_size (number): Results per page when using page (default: 10, max: 1000)
   - sort (string): Sort field and direction (e.g., "metadata_modified desc")
   - facet_field (array): Fields to facet on (e.g., ["organization", "tags"])
   - facet_limit (number): Max facet values per field (default: 50)
@@ -357,7 +369,9 @@ Examples:
   - Field exists: { q: "organization:* AND num_resources:[1 TO *]" }
   - Boosting: { q: "title:climate^2 OR notes:climate" }
   - Filter org: { fq: "organization:regione-siciliana" }
-  - Get facets: { facet_field: ["organization"], rows: 0 }`,
+  - Get facets: { facet_field: ["organization"], rows: 0 }
+
+Typical workflow: ckan_package_search → ckan_package_show (get full metadata + resource IDs) → ckan_datastore_search (query tabular data)`,
         inputSchema: z.object({
             server_url: z.string()
                 .url("Must be a valid URL")
@@ -394,6 +408,18 @@ Examples:
                 .optional()
                 .default(50)
                 .describe("Maximum facet values per field"),
+            page: z.number()
+                .int()
+                .min(1)
+                .optional()
+                .describe("Page number (1-based); alias for start. Overrides start if provided."),
+            page_size: z.number()
+                .int()
+                .min(1)
+                .max(1000)
+                .optional()
+                .default(10)
+                .describe("Results per page when using page (default: 10)"),
             include_drafts: z.boolean()
                 .optional()
                 .default(false)
@@ -418,8 +444,7 @@ Examples:
             destructiveHint: false,
             idempotentHint: true,
             openWorldHint: true
-        },
-        _meta: { ui: { resourceUri: DATASTORE_TABLE_RESOURCE_URI } }
+        }
     }, async (params) => {
         try {
             const userQuery = params.q;
@@ -433,10 +458,11 @@ Examples:
                     effectiveSort = "issued desc, metadata_created desc";
             }
             const { effectiveQuery } = resolveSearchQuery(params.server_url, query, params.query_parser);
+            const { effectiveRows, effectiveStart } = resolvePageParams(params.page, params.page_size, params.start, params.rows);
             const apiParams = {
                 q: effectiveQuery,
-                rows: params.rows,
-                start: params.start,
+                rows: effectiveRows,
+                start: effectiveStart,
                 include_private: params.include_drafts
             };
             if (params.fq)
@@ -447,11 +473,20 @@ Examples:
                 apiParams['facet.field'] = JSON.stringify(params.facet_field);
                 apiParams['facet.limit'] = params.facet_limit;
             }
-            const result = await makeCkanRequest(params.server_url, 'package_search', apiParams);
+            let result = await makeCkanRequest(params.server_url, 'package_search', apiParams);
+            let accentFallbackUsed = false;
+            if (result.count === 0 && hasAccents(params.q)) {
+                const strippedQuery = stripAccents(params.q);
+                const { effectiveQuery: strippedEffective } = resolveSearchQuery(params.server_url, strippedQuery, params.query_parser);
+                const fallbackResult = await makeCkanRequest(params.server_url, 'package_search', { ...apiParams, q: strippedEffective });
+                if (fallbackResult.count > 0) {
+                    result = fallbackResult;
+                    accentFallbackUsed = true;
+                }
+            }
             if (params.response_format === ResponseFormat.JSON) {
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }],
-                    structuredContent: result
+                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }]
                 };
             }
             // Markdown format
@@ -461,9 +496,10 @@ Examples:
 **Query**: ${userQuery}
 ${params.content_recent ? `**Content Recent**: last ${params.content_recent_days ?? 30} days (issued with metadata_created fallback)\n` : ''}
 ${effectiveQuery !== userQuery ? `**Effective Query**: ${effectiveQuery}\n` : ''}
+${accentFallbackUsed ? `**Note**: Original query returned 0 results; retried with accent-stripped query "${stripAccents(params.q)}".\n` : ''}
 ${params.fq ? `**Filter**: ${params.fq}\n` : ''}
 **Total Results**: ${result.count}
-**Showing**: ${result.results.length} results (from ${params.start})
+**Showing**: ${result.results.length} results (from ${effectiveStart})
 
 `;
             // Show facets if available
@@ -512,36 +548,22 @@ ${params.fq ? `**Filter**: ${params.fq}\n` : ''}
             }
             else {
                 markdown += `No datasets found matching your query.\n`;
-            }
-            if (result.count > params.start + params.rows) {
-                const nextStart = params.start + params.rows;
-                markdown += `\n---\n**More results available**: Use \`start: ${nextStart}\` to see next page.\n`;
-            }
-            const tableFields = [
-                { id: "title", type: "text" },
-                { id: "organization", type: "text" },
-                { id: "formats", type: "text" },
-                { id: "num_resources", type: "int" },
-                { id: "metadata_modified", type: "timestamp" },
-                { id: "license_id", type: "text" }
-            ];
-            const tableRecords = (result.results || []).map((pkg) => ({
-                title: pkg.title || pkg.name,
-                url: getDatasetViewUrl(params.server_url, pkg),
-                organization: pkg.organization?.title || "-",
-                formats: [...new Set((pkg.resources || []).map((r) => r.format).filter(Boolean))].join(", ") || "-",
-                num_resources: pkg.num_resources || 0,
-                metadata_modified: pkg.metadata_modified || "-",
-                license_id: pkg.license_id || "-"
-            }));
-            return {
-                content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }],
-                structuredContent: {
-                    server_url: params.server_url,
-                    total: result.count || 0,
-                    fields: tableFields,
-                    records: tableRecords
+                if (isPlainMultiTermQuery(params.q)) {
+                    markdown += `\n> **Tip**: Multi-term queries use AND by default (all terms must match). Try OR to broaden the search:\n`;
+                    markdown += `> \`q: "${buildOrQuery(params.q)}"\`\n`;
                 }
+            }
+            if (result.count > effectiveStart + effectiveRows) {
+                if (params.page !== undefined) {
+                    markdown += `\n---\n**More results available**: Use \`page: ${params.page + 1}\` to see next page.\n`;
+                }
+                else {
+                    const nextStart = effectiveStart + effectiveRows;
+                    markdown += `\n---\n**More results available**: Use \`start: ${nextStart}\` to see next page.\n`;
+                }
+            }
+            return {
+                content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
         }
         catch (error) {
@@ -581,7 +603,9 @@ Returns:
 
 Examples:
   - { server_url: "https://dati.gov.it/opendata", query: "mobilità" }
-  - { server_url: "...", query: "trasporti", limit: 5, weights: { title: 5, notes: 2 } }`,
+  - { server_url: "...", query: "trasporti", limit: 5, weights: { title: 5, notes: 2 } }
+
+Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top results) → ckan_datastore_search (query data)`,
         inputSchema: z.object({
             server_url: z.string()
                 .url()
@@ -734,7 +758,9 @@ Returns:
 
 Examples:
   - { server_url: "https://dati.gov.it/opendata", id: "dataset-name" }
-  - { server_url: "...", id: "abc-123-def", include_tracking: true }`,
+  - { server_url: "...", id: "abc-123-def", include_tracking: true }
+
+Typical workflow: ckan_package_show → pick a resource with datastore_active=true → ckan_datastore_search (query its data)`,
         inputSchema: z.object({
             server_url: z.string()
                 .url()
@@ -777,6 +803,123 @@ Examples:
                 content: [{
                         type: "text",
                         text: `Error fetching package: ${error instanceof Error ? error.message : String(error)}`
+                    }],
+                isError: true
+            };
+        }
+    });
+    /**
+     * List resources in a dataset with a compact summary
+     */
+    server.registerTool("ckan_list_resources", {
+        title: "List CKAN Dataset Resources",
+        description: `List all resources in a dataset with a compact summary.
+
+Returns a focused table of resources showing format, size, DataStore availability, and download URL.
+Use this to quickly assess what files a dataset contains before deciding how to access the data.
+
+Args:
+  - server_url (string): Base URL of CKAN server
+  - id (string): Dataset ID or name
+  - format_filter (string): Filter resources by format, case-insensitive (e.g., "CSV", "json", "XLSX")
+  - response_format ('markdown' | 'json'): Output format
+
+Returns:
+  Compact resource summary with name, ID, format, size, DataStore flag, and URL
+
+Examples:
+  - { server_url: "https://dati.gov.it/opendata", id: "dataset-name" }
+  - { server_url: "...", id: "dataset-name", format_filter: "CSV" }
+
+Typical workflow: ckan_package_search → ckan_list_resources (assess available files) → ckan_datastore_search (for resources with DataStore=true)`,
+        inputSchema: z.object({
+            server_url: z.string()
+                .url()
+                .describe("Base URL of the CKAN server"),
+            id: z.string()
+                .min(1)
+                .describe("Dataset ID or name"),
+            format_filter: z.string()
+                .optional()
+                .describe("Filter resources by format, case-insensitive (e.g., 'CSV', 'json', 'XLSX')"),
+            response_format: ResponseFormatSchema
+        }).strict(),
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: false
+        }
+    }, async (params) => {
+        try {
+            const result = await makeCkanRequest(params.server_url, 'package_show', { id: params.id });
+            const resources = Array.isArray(result.resources) ? result.resources : [];
+            const formatFilter = params.format_filter?.toUpperCase();
+            const summary = resources
+                .filter((r) => !formatFilter || (r.format || "").toUpperCase() === formatFilter)
+                .map((r) => {
+                const effectiveUrl = resolveDownloadUrl(r);
+                return {
+                    name: r.name || "Unnamed Resource",
+                    id: r.id,
+                    format: r.format || "Unknown",
+                    size: r.size ? formatBytes(r.size) : null,
+                    datastore_active: r.datastore_active === true,
+                    url: effectiveUrl
+                };
+            });
+            if (params.response_format === ResponseFormat.JSON) {
+                const payload = {
+                    dataset_id: result.id,
+                    dataset_name: result.name,
+                    dataset_title: result.title || result.name,
+                    total_resources: resources.length,
+                    filtered_resources: summary.length,
+                    format_filter: formatFilter ?? null,
+                    resources: summary
+                };
+                return {
+                    content: [{ type: "text", text: truncateText(JSON.stringify(payload, null, 2)) }],
+                    structuredContent: payload
+                };
+            }
+            let markdown = `# Resources: ${result.title || result.name}\n\n`;
+            markdown += `**Server**: ${params.server_url}\n`;
+            markdown += `**Dataset**: \`${result.name}\` (\`${result.id}\`)\n`;
+            markdown += `**Total Resources**: ${resources.length}`;
+            if (formatFilter) {
+                markdown += ` (showing ${summary.length} ${formatFilter})`;
+            }
+            markdown += `\n\n`;
+            if (summary.length === 0) {
+                markdown += `No resources found in this dataset.\n`;
+            }
+            else {
+                markdown += `| Name | Format | Size | DataStore | ID |\n`;
+                markdown += `| --- | --- | --- | --- | --- |\n`;
+                for (const r of summary) {
+                    const name = r.name.length > 40 ? r.name.substring(0, 37) + '...' : r.name;
+                    const ds = r.datastore_active ? 'Yes' : 'No';
+                    const size = r.size || '-';
+                    markdown += `| ${name} | ${r.format} | ${size} | ${ds} | \`${r.id}\` |\n`;
+                }
+                const dsResources = summary.filter((r) => r.datastore_active);
+                if (dsResources.length > 0) {
+                    markdown += `\n**DataStore-enabled resources** (queryable with \`ckan_datastore_search\`):\n`;
+                    for (const r of dsResources) {
+                        markdown += `- **${r.name}** (${r.format}): \`${r.id}\`\n`;
+                    }
+                }
+            }
+            return {
+                content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
+            };
+        }
+        catch (error) {
+            return {
+                content: [{
+                        type: "text",
+                        text: `Error listing resources: ${error instanceof Error ? error.message : String(error)}`
                     }],
                 isError: true
             };

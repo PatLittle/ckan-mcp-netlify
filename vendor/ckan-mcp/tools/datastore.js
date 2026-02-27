@@ -5,13 +5,11 @@ import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
 import { truncateText, addDemoFooter } from "../utils/formatting.js";
-import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
-import { DATASTORE_TABLE_RESOURCE_URI } from "../resources/datastore-table-ui.js";
 export function registerDatastoreTools(server) {
     /**
      * DataStore search
      */
-    registerAppTool(server, "ckan_datastore_search", {
+    server.registerTool("ckan_datastore_search", {
         title: "Search CKAN DataStore",
         description: `Query data from a CKAN DataStore resource.
 
@@ -35,7 +33,9 @@ Returns:
 Examples:
   - { server_url: "...", resource_id: "abc-123", limit: 50 }
   - { server_url: "...", resource_id: "...", filters: { "regione": "Sicilia" } }
-  - { server_url: "...", resource_id: "...", sort: "anno desc", limit: 100 }`,
+  - { server_url: "...", resource_id: "...", sort: "anno desc", limit: 100 }
+
+Typical workflow: ckan_package_search → ckan_package_show (find resource_id with datastore_active=true) → ckan_datastore_search`,
         inputSchema: z.object({
             server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             resource_id: z.string().min(1).describe("UUID of the DataStore resource (from ckan_package_show resource.id where datastore_active is true)"),
@@ -53,8 +53,7 @@ Examples:
             destructiveHint: false,
             idempotentHint: true,
             openWorldHint: false
-        },
-        _meta: { ui: { resourceUri: DATASTORE_TABLE_RESOURCE_URI } }
+        }
     }, async (params) => {
         try {
             const apiParams = {
@@ -74,8 +73,7 @@ Examples:
             const result = await makeCkanRequest(params.server_url, 'datastore_search', apiParams);
             if (params.response_format === ResponseFormat.JSON) {
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }],
-                    structuredContent: result
+                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }]
                 };
             }
             let markdown = `# DataStore Query Results\n\n`;
@@ -116,14 +114,7 @@ Examples:
                 markdown += `**More results available**: Use \`offset: ${nextOffset}\` for next page.\n`;
             }
             return {
-                content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }],
-                structuredContent: {
-                    server_url: params.server_url,
-                    resource_id: params.resource_id,
-                    total: result.total || 0,
-                    fields: result.fields || [],
-                    records: result.records || []
-                }
+                content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
         }
         catch (error) {
@@ -155,7 +146,9 @@ Returns:
 
 Examples:
   - { server_url: "...", sql: "SELECT * FROM \"abc-123\" LIMIT 10" }
-  - { server_url: "...", sql: "SELECT COUNT(*) AS total FROM \"abc-123\"" }`,
+  - { server_url: "...", sql: "SELECT COUNT(*) AS total FROM \"abc-123\"" }
+
+Typical workflow: ckan_package_show (get resource_id) → ckan_datastore_search_sql (run SQL on it)`,
         inputSchema: z.object({
             server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             sql: z.string().min(1).describe("SQL SELECT query; resource_id is the table name, must be double-quoted (e.g., SELECT * FROM \"abc-123\" LIMIT 10)"),

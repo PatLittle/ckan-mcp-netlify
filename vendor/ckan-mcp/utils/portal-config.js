@@ -1,4 +1,4 @@
-import portalsConfig from "../portals.json" with { type: "json" };
+import portalsConfig from '../portals.json' with { type: "json" };
 function normalizeUrl(url) {
     return url.replace(/\/$/, '');
 }
