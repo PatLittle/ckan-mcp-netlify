@@ -3,6 +3,7 @@
  */
 import axios from "axios";
 import { getPortalApiUrlForHostname, getPortalApiPath } from "./portal-config.js";
+import { DEFAULT_CKAN_SERVER_URL } from "./constants.js";
 const loadZlib = (() => {
     let cached = null;
     return async () => {
@@ -153,9 +154,9 @@ async function decodePossiblyCompressed(data, headers) {
 export async function makeCkanRequest(serverUrl, action, params = {}) {
     const isNode = typeof process !== "undefined" &&
         !!process.versions?.node;
-    let resolvedServerUrl = serverUrl;
+    let resolvedServerUrl = serverUrl || DEFAULT_CKAN_SERVER_URL;
     try {
-        const hostname = new URL(serverUrl).hostname;
+        const hostname = new URL(resolvedServerUrl).hostname;
         const portalApiUrl = getPortalApiUrlForHostname(hostname);
         if (portalApiUrl) {
             resolvedServerUrl = portalApiUrl;

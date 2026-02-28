@@ -4,6 +4,7 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
+import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
 import { truncateText, formatDate, addDemoFooter } from "../utils/formatting.js";
 import { getOrganizationViewUrl } from "../utils/url-generator.js";
 export function registerOrganizationTools(server) {
@@ -29,7 +30,7 @@ Returns:
 
 Typical workflow: ckan_organization_list → ckan_organization_show (inspect one) → ckan_package_search with fq="organization:name" (browse its datasets)`,
         inputSchema: z.object({
-            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
+            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             all_fields: z.boolean().optional().default(false).describe("Return full organization objects (true) or just name slugs (false)"),
             sort: z.string().optional().default("name asc").describe("Sort field and direction (e.g., 'name asc', 'package_count desc')"),
             limit: z.number().int().min(0).optional().default(100).describe("Max organizations to return. Use 0 to get only the count via faceting"),
@@ -184,7 +185,7 @@ Returns:
 
 Typical workflow: ckan_organization_show → ckan_package_show (inspect a dataset) → ckan_datastore_search (query its data)`,
         inputSchema: z.object({
-            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
+            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             id: z.string().min(1).describe("Organization ID (UUID) or machine-readable name slug (e.g., 'regione-siciliana')"),
             include_datasets: z.boolean().optional().default(true).describe("Include the list of datasets published by this organization"),
             include_users: z.boolean().optional().default(false).describe("Include the list of users belonging to this organization"),
@@ -276,7 +277,7 @@ Examples:
 
 Typical workflow: ckan_organization_search → ckan_organization_show (get details) → ckan_package_search with fq="organization:name"`,
         inputSchema: z.object({
-            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
+            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             pattern: z.string().min(1).describe("Name pattern to search for (wildcards added automatically, e.g., 'toscana', 'health')"),
             response_format: ResponseFormatSchema
         }).strict(),

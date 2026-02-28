@@ -5,6 +5,7 @@ import { z } from "zod";
 import axios from "axios";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
+import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
 import { addDemoFooter } from "../utils/formatting.js";
 const MQA_API_BASE = "https://data.europa.eu/api/mqa/cache/datasets";
 const MQA_METRICS_BASE = "https://data.europa.eu/api/hub/repo/datasets";
@@ -672,7 +673,7 @@ export function registerQualityTools(server) {
         "Returns quality score and detailed metrics (accessibility, reusability, interoperability, findability, contextuality) " +
         "from data.europa.eu. Only works with dati.gov.it server. " +
         "Typical workflow: ckan_package_show (get dataset ID) → ckan_get_mqa_quality → ckan_get_mqa_quality_details (for non-max dimensions)", {
-        server_url: z.string().url().describe("Base URL of dati.gov.it (e.g., https://www.dati.gov.it/opendata)"),
+        server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of CKAN server (default: https://open.canada.ca/data)"),
         dataset_id: z.string().describe("Dataset ID or name"),
         response_format: ResponseFormatSchema.optional()
     }, async ({ server_url, dataset_id, response_format }) => {
@@ -715,7 +716,7 @@ export function registerQualityTools(server) {
         "Returns dimension scores, non-max reasons, and raw MQA flags from data.europa.eu. " +
         "Only works with dati.gov.it server. " +
         "Typical workflow: ckan_get_mqa_quality (get overview scores) → ckan_get_mqa_quality_details (inspect failing metrics)", {
-        server_url: z.string().url().describe("Base URL of dati.gov.it (e.g., https://www.dati.gov.it/opendata)"),
+        server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of CKAN server (default: https://open.canada.ca/data)"),
         dataset_id: z.string().describe("Dataset ID or name"),
         response_format: ResponseFormatSchema.optional()
     }, async ({ server_url, dataset_id, response_format }) => {
