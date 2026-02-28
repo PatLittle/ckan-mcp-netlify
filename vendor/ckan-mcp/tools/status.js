@@ -3,6 +3,7 @@
  */
 import { z } from "zod";
 import { makeCkanRequest } from "../utils/http.js";
+import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
 import { addDemoFooter } from "../utils/formatting.js";
 export function registerStatusTools(server) {
     /**
@@ -22,7 +23,7 @@ Returns:
 
 Typical workflow: ckan_status_show (verify server is up) → ckan_package_search (discover datasets)`,
         inputSchema: z.object({
-            server_url: z.string().url().describe("Base URL of the CKAN server")
+            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)")
         }).strict(),
         annotations: {
             readOnlyHint: true,

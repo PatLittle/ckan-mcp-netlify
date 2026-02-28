@@ -5,6 +5,7 @@ import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
 import { truncateText, addDemoFooter } from "../utils/formatting.js";
+import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
 export function registerDatastoreTools(server) {
     /**
      * DataStore search
@@ -37,7 +38,7 @@ Examples:
 
 Typical workflow: ckan_package_search → ckan_package_show (find resource_id with datastore_active=true) → ckan_datastore_search`,
         inputSchema: z.object({
-            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
+            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             resource_id: z.string().min(1).describe("UUID of the DataStore resource (from ckan_package_show resource.id where datastore_active is true)"),
             q: z.string().optional().describe("Full-text search across all fields"),
             filters: z.record(z.any()).optional().describe("Key-value filters for exact matches (e.g., { \"regione\": \"Sicilia\", \"anno\": 2023 })"),
@@ -127,31 +128,20 @@ Typical workflow: ckan_package_search → ckan_package_show (find resource_id wi
             };
         }
     });
-    /**
-     * DataStore SQL search
-     */
-    server.registerTool("ckan_datastore_search_sql", {
-        title: "Search CKAN DataStore with SQL",
-        description: `Run SQL queries on a CKAN DataStore resource.
-
-This endpoint is only available on CKAN portals with DataStore enabled and SQL access exposed.
+    server.registerTool("ckan_datastore_info", {
+        title: "Get CKAN DataStore Resource Info",
+        description: `Get DataStore metadata for a CKAN resource.
 
 Args:
-  - server_url (string): Base URL of CKAN server
-  - sql (string): SQL query (e.g., SELECT * FROM "resource_id" LIMIT 10)
+  - server_url (string): Base URL of CKAN server (default: https://open.canada.ca/data)
+  - resource_id (string): DataStore resource UUID
   - response_format ('markdown' | 'json'): Output format
 
 Returns:
-  SQL query results from DataStore
-
-Examples:
-  - { server_url: "...", sql: "SELECT * FROM \"abc-123\" LIMIT 10" }
-  - { server_url: "...", sql: "SELECT COUNT(*) AS total FROM \"abc-123\"" }
-
-Typical workflow: ckan_package_show (get resource_id) → ckan_datastore_search_sql (run SQL on it)`,
+  DataStore table metadata including fields and metadata`,
         inputSchema: z.object({
-            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
-            sql: z.string().min(1).describe("SQL SELECT query; resource_id is the table name, must be double-quoted (e.g., SELECT * FROM \"abc-123\" LIMIT 10)"),
+            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+            resource_id: z.string().min(1).describe("UUID of the DataStore resource"),
             response_format: ResponseFormatSchema
         }).strict(),
         annotations: {
@@ -162,45 +152,23 @@ Typical workflow: ckan_package_show (get resource_id) → ckan_datastore_search_
         }
     }, async (params) => {
         try {
-            const result = await makeCkanRequest(params.server_url, 'datastore_search_sql', { sql: params.sql });
+            const result = await makeCkanRequest(params.server_url, 'datastore_info', { id: params.resource_id });
             if (params.response_format === ResponseFormat.JSON) {
                 return {
                     content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }],
                     structuredContent: result
                 };
             }
-            const records = result.records || [];
-            const fieldIds = result.fields?.map((field) => field.id) || Object.keys(records[0] || {});
-            let markdown = `# DataStore SQL Results\n\n`;
+            let markdown = `# DataStore Resource Info\n\n`;
             markdown += `**Server**: ${params.server_url}\n`;
-            markdown += `**SQL**: \`${params.sql}\`\n`;
-            markdown += `**Returned**: ${records.length} records\n\n`;
+            markdown += `**Resource ID**: \`${params.resource_id}\`\n\n`;
             if (result.fields && result.fields.length > 0) {
                 markdown += `## Fields\n\n`;
                 markdown += result.fields.map((field) => `- **${field.id}** (${field.type})`).join('\n') + '\n\n';
             }
-            if (records.length > 0 && fieldIds.length > 0) {
-                markdown += `## Records\n\n`;
-                const displayFields = fieldIds.slice(0, 8);
-                markdown += `| ${displayFields.join(' | ')} |\n`;
-                markdown += `| ${displayFields.map(() => '---').join(' | ')} |\n`;
-                for (const record of records.slice(0, 50)) {
-                    const values = displayFields.map((field) => {
-                        const value = record[field];
-                        if (value === null || value === undefined)
-                            return '-';
-                        const text = String(value);
-                        return text.length > 50 ? text.substring(0, 47) + '...' : text;
-                    });
-                    markdown += `| ${values.join(' | ')} |\n`;
-                }
-                if (records.length > 50) {
-                    markdown += `\n... and ${records.length - 50} more records\n`;
-                }
-                markdown += '\n';
-            }
-            else {
-                markdown += 'No records returned by the SQL query.\n';
+            if (result.meta) {
+                markdown += `## Metadata\n\n`;
+                markdown += `\`\`\`json\n${JSON.stringify(result.meta, null, 2)}\n\`\`\`\n\n`;
             }
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
@@ -210,7 +178,7 @@ Typical workflow: ckan_package_show (get resource_id) → ckan_datastore_search_
             return {
                 content: [{
                         type: "text",
-                        text: `Error querying DataStore SQL: ${error instanceof Error ? error.message : String(error)}`
+                        text: `Error fetching DataStore info: ${error instanceof Error ? error.message : String(error)}`
                     }],
                 isError: true
             };
