@@ -14,6 +14,7 @@ Deploys a vendored CKAN MCP server as a Netlify Function at `/mcp` for ChatGPT c
 
 - `GET /mcp` -> health status JSON
 - `POST /mcp` -> MCP JSON-RPC endpoint
+- `GET|POST /cors-proxy` -> generic CORS proxy endpoint (outside MCP)
 
 ## Deploy (Netlify)
 
@@ -41,6 +42,20 @@ MCP tools list:
 curl https://<site>.netlify.app/mcp \
   -H "Content-Type: application/json" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1}'
+```
+
+CORS proxy (GET with full URL):
+
+```bash
+curl "https://<site>.netlify.app/cors-proxy?url=https%3A%2F%2Fopen.canada.ca%2Fdata%2Fapi%2Faction%2Fstatus_show"
+```
+
+CORS proxy (POST JSON payload):
+
+```bash
+curl https://<site>.netlify.app/cors-proxy \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://open.canada.ca/data/api/action/status_show","method":"GET"}'
 ```
 
 ## Notes

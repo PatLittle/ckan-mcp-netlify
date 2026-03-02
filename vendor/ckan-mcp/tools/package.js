@@ -4,6 +4,7 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
+import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
 import { truncateText, formatDate, formatBytes, addDemoFooter } from "../utils/formatting.js";
 import { getDatasetViewUrl } from "../utils/url-generator.js";
 import { resolveSearchQuery, stripAccents, hasAccents, isPlainMultiTermQuery, buildOrQuery } from "../utils/search.js";
@@ -375,7 +376,9 @@ Typical workflow: ckan_package_search → ckan_package_show (get full metadata +
         inputSchema: z.object({
             server_url: z.string()
                 .url("Must be a valid URL")
-                .describe("Base URL of the CKAN server"),
+                .optional()
+                .default(DEFAULT_CKAN_SERVER_URL)
+                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             q: z.string()
                 .optional()
                 .default("*:*")
@@ -609,7 +612,9 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
         inputSchema: z.object({
             server_url: z.string()
                 .url()
-                .describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
+                .optional()
+                .default(DEFAULT_CKAN_SERVER_URL)
+                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             query: z.string()
                 .min(2)
                 .describe("Natural language or keyword query to match against dataset title, notes, tags, and organization"),
@@ -764,7 +769,9 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
         inputSchema: z.object({
             server_url: z.string()
                 .url()
-                .describe("Base URL of the CKAN server"),
+                .optional()
+                .default(DEFAULT_CKAN_SERVER_URL)
+                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             id: z.string()
                 .min(1)
                 .describe("Dataset ID or name"),
@@ -835,7 +842,9 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
         inputSchema: z.object({
             server_url: z.string()
                 .url()
-                .describe("Base URL of the CKAN server"),
+                .optional()
+                .default(DEFAULT_CKAN_SERVER_URL)
+                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
             id: z.string()
                 .min(1)
                 .describe("Dataset ID or name"),

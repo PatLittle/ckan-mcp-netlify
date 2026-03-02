@@ -11,3 +11,8 @@
   from = "/mcp"
   to = "/.netlify/functions/mcp"
   status = 200
+
+[[redirects]]
+  from = "/cors-proxy"
+  to = "/.netlify/functions/cors-proxy"
+  status = 200
