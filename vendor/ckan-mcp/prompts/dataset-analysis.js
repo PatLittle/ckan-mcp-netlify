@@ -22,17 +22,17 @@ ckan_resource_show({
 ## Step 3: Explore DataStore (if available)
 If a resource has \`datastore_active=true\`, use:
 
+ckan_datastore_info({
+  server_url: "${serverUrl}",
+  resource_id: "<resource-id>"
+})
+
+Then query rows with:
+
 ckan_datastore_search({
   server_url: "${serverUrl}",
   resource_id: "<resource-id>",
   limit: 10
-})
-
-For aggregates, use SQL:
-
-ckan_datastore_search_sql({
-  server_url: "${serverUrl}",
-  sql: "SELECT * FROM \"<resource-id>\" LIMIT 10"
 })`;
 export const registerDatasetAnalysisPrompt = (server) => {
     server.registerPrompt(DATASET_ANALYSIS_PROMPT_NAME, {

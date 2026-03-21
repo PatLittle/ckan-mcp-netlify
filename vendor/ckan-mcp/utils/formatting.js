@@ -28,7 +28,7 @@ export function truncateJson(obj, limit = CHARACTER_LIMIT) {
         return json;
     // Shrink known arrays progressively
     const data = structuredClone(obj);
-    const arrayKeys = ['results', 'records', 'resources', 'packages', 'organizations', 'groups', 'tags'];
+    const arrayKeys = ['results', 'records', 'resources', 'packages', 'organizations', 'groups', 'tags', 'fields', 'aliases'];
     for (const key of arrayKeys) {
         if (Array.isArray(data[key]) && data[key].length > 0) {
             const originalCount = data[key].length;

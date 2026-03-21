@@ -130,7 +130,8 @@ Typical usage flow looks like this:
 - start with `ckan_status_show` or `ckan_find_portals`
 - use `ckan_package_search` or `ckan_find_relevant_datasets`
 - inspect a dataset with `ckan_package_show` or `ckan_list_resources`
-- query tabular resources with `ckan_datastore_search` or `ckan_datastore_search_sql`
+- inspect DataStore schema and storage details with `ckan_datastore_info`
+- query tabular resources with `ckan_datastore_search`
 
 ## The Proxy Endpoint
 

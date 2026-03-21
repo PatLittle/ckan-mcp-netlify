@@ -2,9 +2,11 @@
  * CKAN DataStore tools
  */
 import { z } from "zod";
+import { RESOURCE_URI_META_KEY } from "@modelcontextprotocol/ext-apps/server";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, truncateJson, addDemoFooter } from "../utils/formatting.js";
+import { truncateText, truncateJson, addDemoFooter, formatBytes } from "../utils/formatting.js";
+import { DATASTORE_TABLE_RESOURCE_URI } from "../resources/datastore-table-ui.js";
 export function formatDatastoreSearchMarkdown(result, serverUrl, resourceId, offset, limit) {
     let markdown = `# DataStore Query Results\n\n`;
     markdown += `**Server**: ${serverUrl}\n`;
@@ -46,43 +48,6 @@ export function formatDatastoreSearchMarkdown(result, serverUrl, resourceId, off
     }
     return markdown;
 }
-export function formatDatastoreSqlMarkdown(result, serverUrl, sql) {
-    const records = result.records || [];
-    const fieldIds = (result.fields?.map((field) => field.id) || Object.keys(records[0] || {})).filter(id => id !== '_id');
-    let markdown = `# DataStore SQL Results\n\n`;
-    markdown += `**Server**: ${serverUrl}\n`;
-    markdown += `**SQL**: \`${sql}\`\n`;
-    markdown += `**Returned**: ${records.length} records\n\n`;
-    if (result.fields && result.fields.length > 0) {
-        markdown += `## Fields\n\n`;
-        markdown += result.fields.map((field) => `- **${field.id}** (${field.type})`).join('\n') + '\n\n';
-    }
-    if (records.length > 0 && fieldIds.length > 0) {
-        markdown += `## Records\n\n`;
-        const displayFields = fieldIds.slice(0, 8);
-        markdown += `| ${displayFields.join(' | ')} |\n`;
-        markdown += `| ${displayFields.map(() => '---').join(' | ')} |\n`;
-        for (const record of records.slice(0, 50)) {
-            const values = displayFields.map((field) => {
-                const value = record[field];
-                if (value === null || value === undefined)
-                    return '-';
-                const text = String(value);
-                return text.length > 80 ? text.substring(0, 77) + '...' : text;
-            });
-            markdown += `| ${values.join(' | ')} |\n`;
-        }
-        if (records.length > 50) {
-            markdown += `\n... and ${records.length - 50} more records\n`;
-        }
-        markdown += '\n';
-    }
-    else {
-        markdown += 'No records returned by the SQL query.\n';
-        markdown += '\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n';
-    }
-    return markdown;
-}
 /**
  * Compact datastore result: filter _id from fields and records.
  */
@@ -98,6 +63,65 @@ export function compactDatastoreResult(result) {
         records,
         total: result.total ?? 0
     };
+}
+export function compactDatastoreInfoResult(result, resourceId) {
+    return {
+        resource_id: resourceId,
+        meta: {
+            id: result?.meta?.id || resourceId,
+            count: result?.meta?.count ?? 0,
+            table_type: result?.meta?.table_type || null,
+            size: result?.meta?.size ?? null,
+            db_size: result?.meta?.db_size ?? null,
+            idx_size: result?.meta?.idx_size ?? null,
+            aliases: Array.isArray(result?.meta?.aliases) ? result.meta.aliases : []
+        },
+        fields: Array.isArray(result?.fields)
+            ? result.fields.map((field) => ({
+                id: field.id,
+                type: field.type,
+                info: field.info || {},
+                schema: field.schema || {}
+            }))
+            : []
+    };
+}
+export function formatDatastoreInfoMarkdown(result, serverUrl, resourceId) {
+    const meta = result?.meta || {};
+    const fields = Array.isArray(result?.fields) ? result.fields : [];
+    let markdown = `# DataStore Info\n\n`;
+    markdown += `**Server**: ${serverUrl}\n`;
+    markdown += `**Resource ID**: \`${resourceId}\`\n`;
+    markdown += `**Row Count**: ${meta.count ?? 0}\n`;
+    markdown += `**Table Type**: ${meta.table_type || '-'}\n`;
+    markdown += `**Table Size**: ${meta.size != null ? `${meta.size} bytes (${formatBytes(meta.size)})` : '-'}\n`;
+    markdown += `**Database Size**: ${meta.db_size != null ? `${meta.db_size} bytes (${formatBytes(meta.db_size)})` : '-'}\n`;
+    markdown += `**Index Size**: ${meta.idx_size != null ? `${meta.idx_size} bytes (${formatBytes(meta.idx_size)})` : '-'}\n`;
+    markdown += `**Aliases**: ${Array.isArray(meta.aliases) && meta.aliases.length > 0 ? meta.aliases.map((alias) => `\`${alias}\``).join(', ') : '-'}\n\n`;
+    if (fields.length === 0) {
+        markdown += `No field metadata found.\n`;
+        markdown += '\n> **Note**: No schema details were returned by this portal for the requested DataStore resource.\n';
+        return markdown;
+    }
+    markdown += `## Fields\n\n`;
+    for (const field of fields) {
+        const info = field.info || {};
+        const schema = field.schema || {};
+        markdown += `### ${field.id}\n\n`;
+        markdown += `- **Type**: ${field.type || '-'}\n`;
+        markdown += `- **Native Type**: ${schema.native_type || '-'}\n`;
+        markdown += `- **Required**: ${schema.notnull === true ? 'Yes' : 'No'}\n`;
+        markdown += `- **Indexed**: ${schema.is_index === true ? 'Yes' : 'No'}\n`;
+        markdown += `- **Unique Key**: ${schema.uniquekey === true ? 'Yes' : 'No'}\n`;
+        markdown += `- **Foreign Key**: ${schema.foreignkeys === true ? 'Yes' : 'No'}\n`;
+        markdown += `- **Index Name**: ${schema.index_name || '-'}\n`;
+        markdown += `- **Label (EN)**: ${info.label_en || '-'}\n`;
+        markdown += `- **Label (FR)**: ${info.label_fr || '-'}\n`;
+        markdown += `- **Notes (EN)**: ${info.notes_en || '-'}\n`;
+        markdown += `- **Notes (FR)**: ${info.notes_fr || '-'}\n`;
+        markdown += `- **Type Override**: ${info.type_override || '-'}\n\n`;
+    }
+    return markdown;
 }
 export function registerDatastoreTools(server) {
     /**
@@ -152,6 +176,9 @@ Typical workflow: ckan_package_search → ckan_package_show (find resource_id wi
             destructiveHint: false,
             idempotentHint: true,
             openWorldHint: false
+        },
+        _meta: {
+            [RESOURCE_URI_META_KEY]: DATASTORE_TABLE_RESOURCE_URI
         }
     }, async (params) => {
         try {
@@ -173,7 +200,8 @@ Typical workflow: ckan_package_search → ckan_package_show (find resource_id wi
             if (params.response_format === ResponseFormat.JSON) {
                 const compact = compactDatastoreResult(result);
                 return {
-                    content: [{ type: "text", text: truncateJson(compact) }]
+                    content: [{ type: "text", text: truncateJson(compact) }],
+                    structuredContent: compact
                 };
             }
             const markdown = formatDatastoreSearchMarkdown(result, params.server_url, params.resource_id, params.offset, params.limit);
@@ -191,33 +219,30 @@ Typical workflow: ckan_package_search → ckan_package_show (find resource_id wi
             };
         }
     });
-    /**
-     * DataStore SQL search
-     */
-    server.registerTool("ckan_datastore_search_sql", {
-        title: "Search CKAN DataStore with SQL",
-        description: `Run SQL queries on a CKAN DataStore resource.
+    server.registerTool("ckan_datastore_info", {
+        title: "Get CKAN DataStore Info",
+        description: `Get schema and storage metadata for a CKAN DataStore resource.
 
-This endpoint is only available on CKAN portals with DataStore enabled and SQL access exposed.
+Use this to inspect DataStore-specific metadata that is not returned by standard resource metadata,
+including row count, table size, database size, index size, aliases, and detailed field schema info.
 
 Args:
   - server_url (string): Base URL of CKAN server
-  - sql (string): SQL query (e.g., SELECT * FROM "resource_id" LIMIT 10)
+  - resource_id (string): ID of the DataStore resource
   - response_format ('markdown' | 'json'): Output format
 
 Returns:
-  SQL query results from DataStore
+  DataStore table metadata with:
+  - meta: count, table type, table size, database size, index size, aliases
+  - fields: field type, labels, notes, and schema details
 
 Examples:
-  - { server_url: "...", sql: "SELECT * FROM \"abc-123\" LIMIT 10" }
-  - { server_url: "...", sql: "SELECT COUNT(*) AS total FROM \"abc-123\"" }
+  - { server_url: "https://open.canada.ca/data", resource_id: "abc-123" }
 
-Typical workflow: ckan_package_show (get resource_id) → ckan_datastore_search_sql (run SQL on it)
-
-Security note: SQL queries are forwarded directly to the CKAN DataStore API. The CKAN server enforces its own access controls and read-only permissions. No local database is exposed. Queries are limited to public DataStore resources on the target portal.`,
+Typical workflow: ckan_package_show → ckan_datastore_info (inspect schema and sizes) → ckan_datastore_search (query rows)`,
         inputSchema: z.object({
-            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
-            sql: z.string().min(1).describe("SQL SELECT query; resource_id is the table name, must be double-quoted (e.g., SELECT * FROM \"abc-123\" LIMIT 10)"),
+            server_url: z.string().url().describe("Base URL of the CKAN server"),
+            resource_id: z.string().min(1).describe("UUID of the DataStore resource"),
             response_format: ResponseFormatSchema
         }).strict(),
         annotations: {
@@ -228,15 +253,15 @@ Security note: SQL queries are forwarded directly to the CKAN DataStore API. The
         }
     }, async (params) => {
         try {
-            const result = await makeCkanRequest(params.server_url, 'datastore_search_sql', { sql: params.sql });
+            const result = await makeCkanRequest(params.server_url, 'datastore_info', { id: params.resource_id });
+            const compact = compactDatastoreInfoResult(result, params.resource_id);
             if (params.response_format === ResponseFormat.JSON) {
-                const compact = compactDatastoreResult(result);
                 return {
                     content: [{ type: "text", text: truncateJson(compact) }],
                     structuredContent: compact
                 };
             }
-            const markdown = formatDatastoreSqlMarkdown(result, params.server_url, params.sql);
+            const markdown = formatDatastoreInfoMarkdown(result, params.server_url, params.resource_id);
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
@@ -245,7 +270,7 @@ Security note: SQL queries are forwarded directly to the CKAN DataStore API. The
             return {
                 content: [{
                         type: "text",
-                        text: `Error querying DataStore SQL: ${error instanceof Error ? error.message : String(error)}`
+                        text: `Error getting DataStore info: ${error instanceof Error ? error.message : String(error)}`
                     }],
                 isError: true
             };
