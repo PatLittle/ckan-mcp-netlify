@@ -5,7 +5,6 @@ import { z } from "zod";
 import axios from "axios";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
 import { addDemoFooter } from "../utils/formatting.js";
 const MQA_API_BASE = "https://data.europa.eu/api/mqa/cache/datasets";
 const MQA_METRICS_BASE = "https://data.europa.eu/api/hub/repo/datasets";
@@ -461,8 +460,9 @@ function metricAvailability(section, availabilityKey, statusKey) {
     return undefined;
 }
 function normalizeQualityData(data) {
-    const mqaData = data?.mqa ?? data;
-    const breakdown = data?.breakdown;
+    const d = data;
+    const mqaData = (d?.mqa ?? data);
+    const breakdown = d?.breakdown;
     const resultEntry = mqaData?.result?.results?.[0];
     if (!resultEntry || typeof resultEntry !== "object") {
         return { ...data, breakdown };
@@ -669,13 +669,23 @@ export function formatQualityDetailsMarkdown(data, datasetId) {
  * Register MQA quality tools
  */
 export function registerQualityTools(server) {
-    server.tool("ckan_get_mqa_quality", "Get MQA (Metadata Quality Assurance) quality metrics for a dataset on dati.gov.it. " +
-        "Returns quality score and detailed metrics (accessibility, reusability, interoperability, findability, contextuality) " +
-        "from data.europa.eu. Only works with dati.gov.it server. " +
-        "Typical workflow: ckan_package_show (get dataset ID) → ckan_get_mqa_quality → ckan_get_mqa_quality_details (for non-max dimensions)", {
-        server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of CKAN server (default: https://open.canada.ca/data)"),
-        dataset_id: z.string().describe("Dataset ID or name"),
-        response_format: ResponseFormatSchema.optional()
+    server.registerTool("ckan_get_mqa_quality", {
+        title: "Get MQA Quality Score",
+        description: "Get MQA (Metadata Quality Assurance) quality metrics for a dataset on dati.gov.it. " +
+            "Returns quality score and detailed metrics (accessibility, reusability, interoperability, findability, contextuality) " +
+            "from data.europa.eu. Only works with dati.gov.it server. " +
+            "Typical workflow: ckan_package_show (get dataset ID) → ckan_get_mqa_quality → ckan_get_mqa_quality_details (for non-max dimensions)",
+        inputSchema: z.object({
+            server_url: z.string().url().describe("Base URL of dati.gov.it (e.g., https://www.dati.gov.it/opendata)"),
+            dataset_id: z.string().describe("Dataset ID or name"),
+            response_format: ResponseFormatSchema.optional()
+        }).strict(),
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: true
+        }
     }, async ({ server_url, dataset_id, response_format }) => {
         // Validate server URL
         if (!isValidMqaServer(server_url)) {
@@ -712,13 +722,23 @@ export function registerQualityTools(server) {
             };
         }
     });
-    server.tool("ckan_get_mqa_quality_details", "Get detailed MQA (Metadata Quality Assurance) quality reasons for a dataset on dati.gov.it. " +
-        "Returns dimension scores, non-max reasons, and raw MQA flags from data.europa.eu. " +
-        "Only works with dati.gov.it server. " +
-        "Typical workflow: ckan_get_mqa_quality (get overview scores) → ckan_get_mqa_quality_details (inspect failing metrics)", {
-        server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of CKAN server (default: https://open.canada.ca/data)"),
-        dataset_id: z.string().describe("Dataset ID or name"),
-        response_format: ResponseFormatSchema.optional()
+    server.registerTool("ckan_get_mqa_quality_details", {
+        title: "Get MQA Quality Details",
+        description: "Get detailed MQA (Metadata Quality Assurance) quality reasons for a dataset on dati.gov.it. " +
+            "Returns dimension scores, non-max reasons, and raw MQA flags from data.europa.eu. " +
+            "Only works with dati.gov.it server. " +
+            "Typical workflow: ckan_get_mqa_quality (get overview scores) → ckan_get_mqa_quality_details (inspect failing metrics)",
+        inputSchema: z.object({
+            server_url: z.string().url().describe("Base URL of dati.gov.it (e.g., https://www.dati.gov.it/opendata)"),
+            dataset_id: z.string().describe("Dataset ID or name"),
+            response_format: ResponseFormatSchema.optional()
+        }).strict(),
+        annotations: {
+            readOnlyHint: true,
+            destructiveHint: false,
+            idempotentHint: true,
+            openWorldHint: true
+        }
     }, async ({ server_url, dataset_id, response_format }) => {
         if (!isValidMqaServer(server_url)) {
             return {

@@ -4,8 +4,101 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, addDemoFooter } from "../utils/formatting.js";
-import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
+import { truncateText, truncateJson, addDemoFooter } from "../utils/formatting.js";
+export function formatDatastoreSearchMarkdown(result, serverUrl, resourceId, offset, limit) {
+    let markdown = `# DataStore Query Results\n\n`;
+    markdown += `**Server**: ${serverUrl}\n`;
+    markdown += `**Resource ID**: \`${resourceId}\`\n`;
+    markdown += `**Total Records**: ${result.total || 0}\n`;
+    markdown += `**Returned**: ${result.records ? result.records.length : 0} records\n\n`;
+    if (result.fields && result.fields.length > 0) {
+        markdown += `## Fields\n\n`;
+        markdown += result.fields.map((f) => `- **${f.id}** (${f.type})`).join('\n') + '\n\n';
+    }
+    if (result.records && result.records.length > 0) {
+        markdown += `## Records\n\n`;
+        const fields = result.fields ? result.fields.map((f) => f.id).filter(id => id !== '_id') : [];
+        const displayFields = fields.slice(0, 8);
+        markdown += `| ${displayFields.join(' | ')} |\n`;
+        markdown += `| ${displayFields.map(() => '---').join(' | ')} |\n`;
+        for (const record of result.records.slice(0, 50)) {
+            const values = displayFields.map(field => {
+                const val = record[field];
+                if (val === null || val === undefined)
+                    return '-';
+                const str = String(val);
+                return str.length > 80 ? str.substring(0, 77) + '...' : str;
+            });
+            markdown += `| ${values.join(' | ')} |\n`;
+        }
+        if (result.records.length > 50) {
+            markdown += `\n... and ${result.records.length - 50} more records\n`;
+        }
+        markdown += '\n';
+    }
+    else {
+        markdown += 'No records found.\n';
+        markdown += '\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n';
+    }
+    if (result.total && result.total > offset + (result.records?.length || 0)) {
+        const nextOffset = offset + limit;
+        markdown += `**More results available**: Use \`offset: ${nextOffset}\` for next page.\n`;
+    }
+    return markdown;
+}
+export function formatDatastoreSqlMarkdown(result, serverUrl, sql) {
+    const records = result.records || [];
+    const fieldIds = (result.fields?.map((field) => field.id) || Object.keys(records[0] || {})).filter(id => id !== '_id');
+    let markdown = `# DataStore SQL Results\n\n`;
+    markdown += `**Server**: ${serverUrl}\n`;
+    markdown += `**SQL**: \`${sql}\`\n`;
+    markdown += `**Returned**: ${records.length} records\n\n`;
+    if (result.fields && result.fields.length > 0) {
+        markdown += `## Fields\n\n`;
+        markdown += result.fields.map((field) => `- **${field.id}** (${field.type})`).join('\n') + '\n\n';
+    }
+    if (records.length > 0 && fieldIds.length > 0) {
+        markdown += `## Records\n\n`;
+        const displayFields = fieldIds.slice(0, 8);
+        markdown += `| ${displayFields.join(' | ')} |\n`;
+        markdown += `| ${displayFields.map(() => '---').join(' | ')} |\n`;
+        for (const record of records.slice(0, 50)) {
+            const values = displayFields.map((field) => {
+                const value = record[field];
+                if (value === null || value === undefined)
+                    return '-';
+                const text = String(value);
+                return text.length > 80 ? text.substring(0, 77) + '...' : text;
+            });
+            markdown += `| ${values.join(' | ')} |\n`;
+        }
+        if (records.length > 50) {
+            markdown += `\n... and ${records.length - 50} more records\n`;
+        }
+        markdown += '\n';
+    }
+    else {
+        markdown += 'No records returned by the SQL query.\n';
+        markdown += '\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n';
+    }
+    return markdown;
+}
+/**
+ * Compact datastore result: filter _id from fields and records.
+ */
+export function compactDatastoreResult(result) {
+    const fields = (result.fields || []).filter((f) => f.id !== '_id');
+    const records = (result.records || []).map((record) => {
+        const { _id, ...rest } = record;
+        return rest;
+    });
+    return {
+        resource_id: result.resource_id || null,
+        fields,
+        records,
+        total: result.total ?? 0
+    };
+}
 export function registerDatastoreTools(server) {
     /**
      * DataStore search
@@ -15,6 +108,10 @@ export function registerDatastoreTools(server) {
         description: `Query data from a CKAN DataStore resource.
 
 The DataStore allows SQL-like queries on tabular data. Not all resources have DataStore enabled.
+
+The response always includes a Fields section listing all available column names and types.
+Use limit=0 to discover column names without fetching data — do this before using filters
+to avoid guessing column names and getting HTTP 400 errors.
 
 Args:
   - server_url (string): Base URL of CKAN server
@@ -29,21 +126,22 @@ Args:
   - response_format ('markdown' | 'json'): Output format
 
 Returns:
-  DataStore records matching query
+  DataStore records matching query, always including available column names and types
 
 Examples:
+  - { server_url: "...", resource_id: "abc-123", limit: 0 }  ← discover columns first
   - { server_url: "...", resource_id: "abc-123", limit: 50 }
   - { server_url: "...", resource_id: "...", filters: { "regione": "Sicilia" } }
   - { server_url: "...", resource_id: "...", sort: "anno desc", limit: 100 }
 
-Typical workflow: ckan_package_search → ckan_package_show (find resource_id with datastore_active=true) → ckan_datastore_search`,
+Typical workflow: ckan_package_search → ckan_package_show (find resource_id with datastore_active=true) → ckan_datastore_search (limit=0 to get columns) → ckan_datastore_search (with filters)`,
         inputSchema: z.object({
-            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             resource_id: z.string().min(1).describe("UUID of the DataStore resource (from ckan_package_show resource.id where datastore_active is true)"),
             q: z.string().optional().describe("Full-text search across all fields"),
             filters: z.record(z.any()).optional().describe("Key-value filters for exact matches (e.g., { \"regione\": \"Sicilia\", \"anno\": 2023 })"),
-            limit: z.number().int().min(1).max(32000).optional().default(100).describe("Max rows to return (default 100, max 32000)"),
-            offset: z.number().int().min(0).optional().default(0).describe("Pagination offset"),
+            limit: z.coerce.number().int().min(0).max(32000).optional().default(100).describe("Max rows to return (default 100, max 32000); use 0 to get only column names without data"),
+            offset: z.coerce.number().int().min(0).optional().default(0).describe("Pagination offset"),
             fields: z.array(z.string()).optional().describe("Specific field names to return; omit to return all fields"),
             sort: z.string().optional().describe("Sort expression (e.g., 'anno desc', 'nome asc')"),
             distinct: z.boolean().optional().default(false).describe("Return only distinct rows"),
@@ -73,47 +171,12 @@ Typical workflow: ckan_package_search → ckan_package_show (find resource_id wi
                 apiParams.sort = params.sort;
             const result = await makeCkanRequest(params.server_url, 'datastore_search', apiParams);
             if (params.response_format === ResponseFormat.JSON) {
+                const compact = compactDatastoreResult(result);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }]
+                    content: [{ type: "text", text: truncateJson(compact) }]
                 };
             }
-            let markdown = `# DataStore Query Results\n\n`;
-            markdown += `**Server**: ${params.server_url}\n`;
-            markdown += `**Resource ID**: \`${params.resource_id}\`\n`;
-            markdown += `**Total Records**: ${result.total || 0}\n`;
-            markdown += `**Returned**: ${result.records ? result.records.length : 0} records\n\n`;
-            if (result.fields && result.fields.length > 0) {
-                markdown += `## Fields\n\n`;
-                markdown += result.fields.map((f) => `- **${f.id}** (${f.type})`).join('\n') + '\n\n';
-            }
-            if (result.records && result.records.length > 0) {
-                markdown += `## Records\n\n`;
-                // Create a simple table
-                const fields = result.fields.map((f) => f.id);
-                const displayFields = fields.slice(0, 8); // Limit columns for readability
-                // Header
-                markdown += `| ${displayFields.join(' | ')} |\n`;
-                markdown += `| ${displayFields.map(() => '---').join(' | ')} |\n`;
-                // Rows (limit to 50 for readability)
-                for (const record of result.records.slice(0, 50)) {
-                    const values = displayFields.map(field => {
-                        const val = record[field];
-                        if (val === null || val === undefined)
-                            return '-';
-                        const str = String(val);
-                        return str.length > 50 ? str.substring(0, 47) + '...' : str;
-                    });
-                    markdown += `| ${values.join(' | ')} |\n`;
-                }
-                if (result.records.length > 50) {
-                    markdown += `\n... and ${result.records.length - 50} more records\n`;
-                }
-                markdown += '\n';
-            }
-            if (result.total && result.total > params.offset + (result.records?.length || 0)) {
-                const nextOffset = params.offset + params.limit;
-                markdown += `**More results available**: Use \`offset: ${nextOffset}\` for next page.\n`;
-            }
+            const markdown = formatDatastoreSearchMarkdown(result, params.server_url, params.resource_id, params.offset, params.limit);
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
@@ -128,20 +191,33 @@ Typical workflow: ckan_package_search → ckan_package_show (find resource_id wi
             };
         }
     });
-    server.registerTool("ckan_datastore_info", {
-        title: "Get CKAN DataStore Resource Info",
-        description: `Get DataStore metadata for a CKAN resource.
+    /**
+     * DataStore SQL search
+     */
+    server.registerTool("ckan_datastore_search_sql", {
+        title: "Search CKAN DataStore with SQL",
+        description: `Run SQL queries on a CKAN DataStore resource.
+
+This endpoint is only available on CKAN portals with DataStore enabled and SQL access exposed.
 
 Args:
-  - server_url (string): Base URL of CKAN server (default: https://open.canada.ca/data)
-  - resource_id (string): DataStore resource UUID
+  - server_url (string): Base URL of CKAN server
+  - sql (string): SQL query (e.g., SELECT * FROM "resource_id" LIMIT 10)
   - response_format ('markdown' | 'json'): Output format
 
 Returns:
-  DataStore table metadata including fields and metadata`,
+  SQL query results from DataStore
+
+Examples:
+  - { server_url: "...", sql: "SELECT * FROM \"abc-123\" LIMIT 10" }
+  - { server_url: "...", sql: "SELECT COUNT(*) AS total FROM \"abc-123\"" }
+
+Typical workflow: ckan_package_show (get resource_id) → ckan_datastore_search_sql (run SQL on it)
+
+Security note: SQL queries are forwarded directly to the CKAN DataStore API. The CKAN server enforces its own access controls and read-only permissions. No local database is exposed. Queries are limited to public DataStore resources on the target portal.`,
         inputSchema: z.object({
-            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
-            resource_id: z.string().min(1).describe("UUID of the DataStore resource"),
+            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
+            sql: z.string().min(1).describe("SQL SELECT query; resource_id is the table name, must be double-quoted (e.g., SELECT * FROM \"abc-123\" LIMIT 10)"),
             response_format: ResponseFormatSchema
         }).strict(),
         annotations: {
@@ -152,24 +228,15 @@ Returns:
         }
     }, async (params) => {
         try {
-            const result = await makeCkanRequest(params.server_url, 'datastore_info', { id: params.resource_id });
+            const result = await makeCkanRequest(params.server_url, 'datastore_search_sql', { sql: params.sql });
             if (params.response_format === ResponseFormat.JSON) {
+                const compact = compactDatastoreResult(result);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }],
-                    structuredContent: result
+                    content: [{ type: "text", text: truncateJson(compact) }],
+                    structuredContent: compact
                 };
             }
-            let markdown = `# DataStore Resource Info\n\n`;
-            markdown += `**Server**: ${params.server_url}\n`;
-            markdown += `**Resource ID**: \`${params.resource_id}\`\n\n`;
-            if (result.fields && result.fields.length > 0) {
-                markdown += `## Fields\n\n`;
-                markdown += result.fields.map((field) => `- **${field.id}** (${field.type})`).join('\n') + '\n\n';
-            }
-            if (result.meta) {
-                markdown += `## Metadata\n\n`;
-                markdown += `\`\`\`json\n${JSON.stringify(result.meta, null, 2)}\n\`\`\`\n\n`;
-            }
+            const markdown = formatDatastoreSqlMarkdown(result, params.server_url, params.sql);
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
@@ -178,7 +245,7 @@ Returns:
             return {
                 content: [{
                         type: "text",
-                        text: `Error fetching DataStore info: ${error instanceof Error ? error.message : String(error)}`
+                        text: `Error querying DataStore SQL: ${error instanceof Error ? error.message : String(error)}`
                     }],
                 isError: true
             };

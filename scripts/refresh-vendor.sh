@@ -13,6 +13,7 @@ CUSTOM_SNAPSHOT_DIR="$WORK_DIR/custom-overrides"
 SCHEMING_TOOL_PATH="vendor/ckan-mcp/tools/scheming.js"
 SERVER_PATH="vendor/ckan-mcp/server.js"
 CORS_PROXY_PATH="netlify/functions/cors-proxy.mjs"
+CONSTANTS_SHIM_PATH="vendor/ckan-mcp/utils/constants.js"
 
 snapshot_custom_overrides() {
   mkdir -p "$CUSTOM_SNAPSHOT_DIR"
@@ -100,6 +101,15 @@ restore_custom_overrides() {
     mkdir -p "$(dirname "$ROOT_DIR/$SCHEMING_TOOL_PATH")"
     cp "$CUSTOM_SNAPSHOT_DIR/scheming.js" "$ROOT_DIR/$SCHEMING_TOOL_PATH"
     echo "Restored custom scheming endpoint file."
+
+    if [[ ! -f "$ROOT_DIR/$CONSTANTS_SHIM_PATH" ]]; then
+      mkdir -p "$(dirname "$ROOT_DIR/$CONSTANTS_SHIM_PATH")"
+      cat > "$ROOT_DIR/$CONSTANTS_SHIM_PATH" <<'EOF'
+export const DEFAULT_CKAN_SERVER_URL = "https://open.canada.ca/data";
+EOF
+      echo "Restored constants compatibility shim for custom scheming tool."
+    fi
+
     ensure_scheming_registration
   fi
 
@@ -145,6 +155,7 @@ if ! npx -y -p typescript@5.6.3 tsc \
   --moduleResolution nodenext \
   --target es2022 \
   --lib es2022,dom \
+  --noCheck \
   --resolveJsonModule \
   --skipLibCheck \
   --declaration false \

@@ -12,8 +12,26 @@
             "search": {
                 "force_text_field": true
             },
+            "hvd": {
+                "category_field": "hvd_category"
+            },
+            "sparql": {
+                "endpoint_url": "https://lod.dati.gov.it/sparql",
+                "method": "GET"
+            },
             "dataset_view_url": "https://www.dati.gov.it/view-dataset/dataset?id={id}",
             "organization_view_url": "https://www.dati.gov.it/view-dataset?organization={name}"
+        },
+        {
+            "id": "dati-arpae-it",
+            "name": "dati.arpae.it",
+            "api_url": "https://dati.arpae.it",
+            "api_url_aliases": [
+                "http://dati.arpae.it"
+            ],
+            "search": {
+                "force_text_field": true
+            }
         },
         {
             "id": "anac-opendata",
@@ -35,6 +53,9 @@
                 "http://www.data.gov.uk"
             ],
             "api_path": "/api/action",
+            "search": {
+                "force_text_field": true
+            },
             "dataset_view_url": "https://www.data.gov.uk/dataset/{id}/{name}",
             "organization_view_url": "https://www.data.gov.uk/organization/{name}"
         },
@@ -44,7 +65,10 @@
             "api_url": "https://catalog.data.gov",
             "api_url_aliases": [
                 "http://catalog.data.gov"
-            ]
+            ],
+            "search": {
+                "force_text_field": true
+            }
         },
         {
             "id": "open-canada",
@@ -54,7 +78,10 @@
                 "http://open.canada.ca/data",
                 "https://open.canada.ca",
                 "http://open.canada.ca"
-            ]
+            ],
+            "search": {
+                "force_text_field": true
+            }
         },
         {
             "id": "data-gov-au",
@@ -78,6 +105,17 @@
                 "https://www.opendata.swiss",
                 "http://www.opendata.swiss"
             ]
+        },
+        {
+            "id": "data-stadt-zuerich-ch",
+            "name": "data.stadt-zuerich.ch",
+            "api_url": "https://data.stadt-zuerich.ch",
+            "api_url_aliases": [
+                "http://data.stadt-zuerich.ch",
+                "https://www.data.stadt-zuerich.ch",
+                "https://ckan-prod.zurich.datopian.com"
+            ],
+            "organization_view_url": "https://ckan-prod.zurich.datopian.com/organization/{name}"
         },
         {
             "id": "govdata-de",

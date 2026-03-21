@@ -6,7 +6,10 @@ import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
 import { truncateText, addDemoFooter } from "../utils/formatting.js";
 export function normalizeTagFacets(result) {
-    const searchItems = result?.search_facets?.tags?.items;
+    const r = result;
+    const searchFacets = r?.search_facets;
+    const tagsGroup = searchFacets?.tags;
+    const searchItems = tagsGroup?.items;
     if (Array.isArray(searchItems)) {
         return searchItems.map((item) => ({
             name: item?.name || item?.display_name || String(item),
@@ -14,7 +17,7 @@ export function normalizeTagFacets(result) {
             display_name: item?.display_name
         }));
     }
-    const facets = result?.facets?.tags;
+    const facets = r?.facets?.tags;
     if (Array.isArray(facets)) {
         if (facets.length > 0 && typeof facets[0] === 'object') {
             return facets.map((item) => ({

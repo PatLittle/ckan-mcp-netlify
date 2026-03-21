@@ -4,21 +4,52 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, formatDate, addDemoFooter } from "../utils/formatting.js";
+import { truncateText, truncateJson, formatDate, addDemoFooter } from "../utils/formatting.js";
 function getGroupViewUrl(serverUrl, group) {
     const cleanServerUrl = serverUrl.replace(/\/$/, '');
     return `${cleanServerUrl}/group/${group.name}`;
 }
+export function formatGroupShowMarkdown(result, serverUrl) {
+    let markdown = `# Group: ${result.title || result.name}\n\n`;
+    markdown += `**Server**: ${serverUrl}\n`;
+    markdown += `**Link**: ${getGroupViewUrl(serverUrl, result)}\n\n`;
+    markdown += `## Details\n\n`;
+    markdown += `- **ID**: \`${result.id}\`\n`;
+    markdown += `- **Name**: \`${result.name}\`\n`;
+    markdown += `- **Datasets**: ${result.package_count || 0}\n`;
+    markdown += `- **Created**: ${formatDate(result.created)}\n`;
+    markdown += `- **State**: ${result.state}\n\n`;
+    if (result.description) {
+        markdown += `## Description\n\n${result.description}\n\n`;
+    }
+    if (result.packages && result.packages.length > 0) {
+        const displayed = Math.min(result.packages.length, 20);
+        const totalHint = result.package_count && result.package_count !== result.packages.length
+            ? ` — ${result.package_count} total`
+            : '';
+        markdown += `## Datasets (showing ${displayed} of ${result.packages.length} returned${totalHint})\n\n`;
+        for (const pkg of result.packages.slice(0, 20)) {
+            markdown += `- **${pkg.title || pkg.name}** (\`${pkg.name}\`)\n`;
+        }
+        if (result.packages.length > 20) {
+            markdown += `\n... and ${result.packages.length - 20} more datasets\n`;
+        }
+        markdown += '\n';
+    }
+    return markdown;
+}
 function normalizeGroupFacets(result) {
-    const items = result?.search_facets?.groups?.items;
-    if (Array.isArray(items)) {
-        return items.map((item) => ({
+    const r = result;
+    const items = r?.search_facets?.groups;
+    const itemsArr = items?.items;
+    if (Array.isArray(itemsArr)) {
+        return itemsArr.map((item) => ({
             name: item?.name || item?.display_name || String(item),
             display_name: item?.display_name,
             count: typeof item?.count === 'number' ? item.count : 0
         }));
     }
-    const facets = result?.facets?.groups;
+    const facets = r?.facets?.groups;
     if (Array.isArray(facets)) {
         if (facets.length > 0 && typeof facets[0] === 'object') {
             return facets.map((item) => ({
@@ -36,6 +67,45 @@ function normalizeGroupFacets(result) {
         }));
     }
     return [];
+}
+/**
+ * Compact JSON for group_list results.
+ */
+export function compactGroupList(result) {
+    if (!Array.isArray(result))
+        return result;
+    return {
+        count: result.length,
+        groups: result.map((group) => {
+            if (typeof group === 'string')
+                return group;
+            return {
+                id: group.id,
+                name: group.name,
+                title: group.title || group.name,
+                package_count: group.package_count ?? 0
+            };
+        })
+    };
+}
+/**
+ * Compact JSON for group_show results.
+ */
+export function compactGroupShow(result) {
+    return {
+        id: result.id,
+        name: result.name,
+        title: result.title || result.name,
+        description: result.description || null,
+        package_count: result.package_count ?? 0,
+        created: result.created || null,
+        packages: (result.packages || []).map((pkg) => ({
+            id: pkg.id,
+            name: pkg.name,
+            title: pkg.title || pkg.name,
+            metadata_modified: pkg.metadata_modified || null
+        }))
+    };
 }
 export function registerGroupTools(server) {
     server.registerTool("ckan_group_list", {
@@ -97,12 +167,10 @@ Typical workflow: ckan_group_list → ckan_group_show (inspect one) → ckan_pac
                 offset: params.offset
             });
             if (params.response_format === ResponseFormat.JSON) {
-                const output = Array.isArray(result)
-                    ? { count: result.length, groups: result }
-                    : result;
+                const compact = compactGroupList(result);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(output, null, 2)) }],
-                    structuredContent: output
+                    content: [{ type: "text", text: truncateJson(compact) }],
+                    structuredContent: compact
                 };
             }
             let markdown = `# CKAN Groups\n\n`;
@@ -172,33 +240,13 @@ Typical workflow: ckan_group_show → ckan_package_show (inspect a dataset) → 
                 include_datasets: params.include_datasets
             });
             if (params.response_format === ResponseFormat.JSON) {
+                const compact = compactGroupShow(result);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }],
-                    structuredContent: result
+                    content: [{ type: "text", text: truncateJson(compact) }],
+                    structuredContent: compact
                 };
             }
-            let markdown = `# Group: ${result.title || result.name}\n\n`;
-            markdown += `**Server**: ${params.server_url}\n`;
-            markdown += `**Link**: ${getGroupViewUrl(params.server_url, result)}\n\n`;
-            markdown += `## Details\n\n`;
-            markdown += `- **ID**: \`${result.id}\`\n`;
-            markdown += `- **Name**: \`${result.name}\`\n`;
-            markdown += `- **Datasets**: ${result.package_count || 0}\n`;
-            markdown += `- **Created**: ${formatDate(result.created)}\n`;
-            markdown += `- **State**: ${result.state}\n\n`;
-            if (result.description) {
-                markdown += `## Description\n\n${result.description}\n\n`;
-            }
-            if (result.packages && result.packages.length > 0) {
-                markdown += `## Datasets (${result.packages.length})\n\n`;
-                for (const pkg of result.packages.slice(0, 20)) {
-                    markdown += `- **${pkg.title || pkg.name}** (\`${pkg.name}\`)\n`;
-                }
-                if (result.packages.length > 20) {
-                    markdown += `\n... and ${result.packages.length - 20} more datasets\n`;
-                }
-                markdown += '\n';
-            }
+            const markdown = formatGroupShowMarkdown(result, params.server_url);
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
@@ -273,6 +321,7 @@ Typical workflow: ckan_group_search → ckan_group_show (get details) → ckan_p
             markdown += `**Total Datasets**: ${totalDatasets}\n\n`;
             if (groupFacets.length === 0) {
                 markdown += `No groups found matching pattern "${params.pattern}".\n`;
+                markdown += `\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n`;
             }
             else {
                 markdown += `## Matching Groups\n\n`;

@@ -3,7 +3,6 @@
  */
 import axios from "axios";
 import { getPortalApiUrlForHostname, getPortalApiPath } from "./portal-config.js";
-import { DEFAULT_CKAN_SERVER_URL } from "./constants.js";
 const loadZlib = (() => {
     let cached = null;
     return async () => {
@@ -149,14 +148,65 @@ async function decodePossiblyCompressed(data, headers) {
     }
 }
 /**
+ * Validate that a server URL is safe to request (SSRF prevention).
+ * Blocks non-HTTP/S protocols and private/internal IP ranges.
+ */
+export function validateServerUrl(serverUrl) {
+    let parsed;
+    try {
+        parsed = new URL(serverUrl);
+    }
+    catch {
+        throw new Error(`Invalid URL: ${serverUrl}`);
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        throw new Error(`Disallowed protocol "${parsed.protocol}". Only http and https are allowed.`);
+    }
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === 'localhost') {
+        throw new Error(`Access to "${hostname}" is not allowed.`);
+    }
+    // Block IPv4 private/special ranges
+    const ipv4 = hostname.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+    if (ipv4) {
+        const [o1, o2] = ipv4.slice(1).map(Number);
+        const blocked = o1 === 0 || // 0.0.0.0/8
+            o1 === 10 || // 10.0.0.0/8 private
+            o1 === 127 || // 127.0.0.0/8 loopback
+            (o1 === 100 && o2 >= 64 && o2 <= 127) || // 100.64.0.0/10 shared
+            (o1 === 169 && o2 === 254) || // 169.254.0.0/16 link-local / AWS metadata
+            (o1 === 172 && o2 >= 16 && o2 <= 31) || // 172.16.0.0/12 private
+            (o1 === 192 && o2 === 168) || // 192.168.0.0/16 private
+            o1 === 255; // broadcast
+        if (blocked) {
+            throw new Error(`Access to private/internal IP addresses is not allowed.`);
+        }
+    }
+    // Block IPv6 private/loopback
+    if (hostname.startsWith('[')) {
+        const ipv6 = hostname.slice(1, -1);
+        const lower = ipv6.toLowerCase();
+        const blockedIpv6 = lower === '::1' || // loopback
+            lower === '::' || // unspecified
+            lower.startsWith('fc') || // fc00::/7 unique local
+            lower.startsWith('fd') || // fd00::/8 unique local
+            lower.startsWith('fe80') || // fe80::/10 link-local
+            lower.startsWith('::ffff:'); // IPv4-mapped
+        if (blockedIpv6) {
+            throw new Error(`Access to private/internal IPv6 addresses is not allowed.`);
+        }
+    }
+}
+/**
  * Make HTTP request to CKAN API
  */
 export async function makeCkanRequest(serverUrl, action, params = {}) {
     const isNode = typeof process !== "undefined" &&
         !!process.versions?.node;
-    let resolvedServerUrl = serverUrl || DEFAULT_CKAN_SERVER_URL;
+    validateServerUrl(serverUrl);
+    let resolvedServerUrl = serverUrl;
     try {
-        const hostname = new URL(resolvedServerUrl).hostname;
+        const hostname = new URL(serverUrl).hostname;
         const portalApiUrl = getPortalApiUrlForHostname(hostname);
         if (portalApiUrl) {
             resolvedServerUrl = portalApiUrl;
@@ -181,11 +231,6 @@ export async function makeCkanRequest(serverUrl, action, params = {}) {
                     'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
                     'Accept-Encoding': 'gzip, deflate, br',
                     Connection: 'keep-alive',
-                    Referer: `${baseUrl}/`,
-                    'Sec-Fetch-Site': 'same-origin',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Dest': 'document',
-                    'Upgrade-Insecure-Requests': '1',
                     'Sec-CH-UA': '"Chromium";v="120", "Not?A_Brand";v="24", "Google Chrome";v="120"',
                     'Sec-CH-UA-Mobile': '?0',
                     'Sec-CH-UA-Platform': '"Linux"',
@@ -205,14 +250,23 @@ export async function makeCkanRequest(serverUrl, action, params = {}) {
             const fetchUrl = searchParams.toString()
                 ? `${url}?${searchParams.toString()}`
                 : url;
-            const response = await fetch(fetchUrl, {
-                method: "GET",
-                headers: {
-                    Accept: "application/json, text/plain, */*",
-                    "Accept-Encoding": "identity",
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                }
-            });
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 30000);
+            let response;
+            try {
+                response = await fetch(fetchUrl, {
+                    method: "GET",
+                    signal: controller.signal,
+                    headers: {
+                        Accept: "application/json, text/plain, */*",
+                        "Accept-Encoding": "identity",
+                        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    }
+                });
+            }
+            finally {
+                clearTimeout(timeoutId);
+            }
             if (!response.ok) {
                 throw new Error(`CKAN API error (${response.status}): ${response.statusText}`);
             }

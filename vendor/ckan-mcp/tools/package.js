@@ -4,10 +4,37 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
-import { truncateText, formatDate, formatBytes, addDemoFooter } from "../utils/formatting.js";
+import { truncateText, truncateJson, formatDate, formatBytes, addDemoFooter } from "../utils/formatting.js";
 import { getDatasetViewUrl } from "../utils/url-generator.js";
 import { resolveSearchQuery, stripAccents, hasAccents, isPlainMultiTermQuery, buildOrQuery } from "../utils/search.js";
+import { getPortalHvdConfig, getPortalApiPath, requiresMultilingualNormalization, isPortalSearchExplicitlyConfigured } from "../utils/portal-config.js";
+/**
+ * Session cache for auto-detected parser mode on unknown portals.
+ * Key: normalized server URL. Value: true = needs text:(...) wrapping.
+ * Populated by probePortalParser() on first call to an unconfigured portal.
+ */
+const _portalParserCache = new Map();
+/**
+ * Probe a portal to detect whether it needs force_text_field.
+ * Runs two parallel rows=0 queries (default vs text parser) using "data OR dati".
+ * If text count > default count * 2, the portal has the Solr df bug and needs wrapping.
+ * Result is cached for the session lifetime.
+ */
+async function probePortalParser(serverUrl) {
+    const key = serverUrl.replace(/\/$/, '').toLowerCase();
+    if (_portalParserCache.has(key))
+        return _portalParserCache.get(key);
+    const probe = 'data OR dati';
+    const [defaultRes, textRes] = await Promise.allSettled([
+        makeCkanRequest(serverUrl, 'package_search', { q: probe, rows: 0 }),
+        makeCkanRequest(serverUrl, 'package_search', { q: `text:(${probe})`, rows: 0 })
+    ]);
+    const defaultCount = defaultRes.status === 'fulfilled' ? (defaultRes.value.count ?? 0) : 0;
+    const textCount = textRes.status === 'fulfilled' ? (textRes.value.count ?? 0) : 0;
+    const needsText = textCount > 0 && (defaultCount === 0 || textCount > defaultCount * 2);
+    _portalParserCache.set(key, needsText);
+    return needsText;
+}
 const DEFAULT_RELEVANCE_WEIGHTS = {
     title: 4,
     notes: 2,
@@ -156,7 +183,8 @@ export const enrichPackageShowResult = (result) => ({
 export const formatPackageShowMarkdown = (result, serverUrl) => {
     let markdown = `# Dataset: ${result.title || result.name}\n\n`;
     markdown += `**Server**: ${serverUrl}\n`;
-    markdown += `**Link**: ${getDatasetViewUrl(serverUrl, result)}\n\n`;
+    markdown += `**Link**: ${getDatasetViewUrl(serverUrl, result)}\n`;
+    markdown += `**Full JSON metadata**: ${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/package_show?id=${result.id}\n\n`;
     markdown += `## Basic Information\n\n`;
     markdown += `- **ID**: \`${result.id}\`\n`;
     markdown += `- **Name**: \`${result.name}\`\n`;
@@ -242,6 +270,7 @@ export const formatPackageShowMarkdown = (result, serverUrl) => {
             else {
                 markdown += `- **DataStore**: ❓ Not reported by portal\n`;
             }
+            markdown += `- **Full JSON metadata**: ${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/resource_show?id=${resource.id}\n`;
             markdown += '\n';
         }
     }
@@ -259,6 +288,160 @@ export function resolvePageParams(page, pageSize, start, rows) {
         return { effectiveStart: (page - 1) * pageSize, effectiveRows: pageSize };
     }
     return { effectiveStart: start, effectiveRows: rows };
+}
+/**
+ * Resolve a single Solr NOW expression to an ISO 8601 datetime string.
+ * Handles: NOW, NOW±Nunit, NOW/DAY, NOW/MONTH.
+ * Used to convert date math for CKAN extra fields (issued, modified) that
+ * are not native Solr fields and do not support NOW syntax.
+ */
+function resolveNowExpr(nowExpr) {
+    const upper = nowExpr.toUpperCase();
+    const now = new Date();
+    if (upper === 'NOW')
+        return now.toISOString();
+    const floorMatch = upper.match(/^NOW\/(DAY|MONTH)$/);
+    if (floorMatch) {
+        if (floorMatch[1] === 'DAY')
+            now.setUTCHours(0, 0, 0, 0);
+        else {
+            now.setUTCDate(1);
+            now.setUTCHours(0, 0, 0, 0);
+        }
+        return now.toISOString();
+    }
+    const arithMatch = upper.match(/^NOW([+-])(\d+)(YEARS?|MONTHS?|DAYS?|HOURS?|MINUTES?|SECONDS?)$/);
+    if (arithMatch) {
+        const sign = arithMatch[1] === '+' ? 1 : -1;
+        const n = parseInt(arithMatch[2]);
+        const unit = arithMatch[3].replace(/S$/, '');
+        switch (unit) {
+            case 'YEAR':
+                now.setUTCFullYear(now.getUTCFullYear() + sign * n);
+                break;
+            case 'MONTH':
+                now.setUTCMonth(now.getUTCMonth() + sign * n);
+                break;
+            case 'DAY':
+                now.setUTCDate(now.getUTCDate() + sign * n);
+                break;
+            case 'HOUR':
+                now.setUTCHours(now.getUTCHours() + sign * n);
+                break;
+            case 'MINUTE':
+                now.setUTCMinutes(now.getUTCMinutes() + sign * n);
+                break;
+            case 'SECOND':
+                now.setUTCSeconds(now.getUTCSeconds() + sign * n);
+                break;
+        }
+        return now.toISOString();
+    }
+    return nowExpr;
+}
+/**
+ * Convert NOW date math to ISO dates for CKAN extra fields (issued, modified).
+ * These fields are not native Solr date fields and do not support NOW syntax.
+ * Leaves metadata_modified and metadata_created untouched (they are native Solr fields).
+ */
+function convertNowForExtraFields(str) {
+    return str.replace(/\b(issued|modified):\[([^\]]*)\]/gi, (_match, field, range) => {
+        const converted = range.replace(/\bNOW(?:[+-]\d+(?:YEARS?|MONTHS?|DAYS?|HOURS?|MINUTES?|SECONDS?)|\/(?:DAY|MONTH))?\b/gi, (now) => resolveNowExpr(now));
+        return `${field}:[${converted}]`;
+    });
+}
+/**
+ * Normalize a package from portals with non-standard field structure (e.g. data.europa.eu).
+ * Falls back to translation fields when title/name are null, and handles organization.title
+ * as a multilingual object.
+ */
+function normalizePackage(pkg) {
+    const translation = pkg.translation;
+    if (!pkg.title && translation) {
+        pkg = { ...pkg, title: translation.en?.title || Object.values(translation)[0]?.title };
+    }
+    if (!pkg.name) {
+        pkg = { ...pkg, name: pkg.id };
+    }
+    if (pkg.organization?.title && typeof pkg.organization.title === 'object') {
+        const titleObj = pkg.organization.title;
+        pkg = { ...pkg, organization: { ...pkg.organization, title: titleObj.en || Object.values(titleObj)[0] } };
+    }
+    if (pkg.tags) {
+        pkg = { ...pkg, tags: pkg.tags.map((t) => t.name ? t : { ...t, name: t.id || t['display-name'] || '' }) };
+    }
+    return pkg;
+}
+/**
+ * Compact JSON representation of package_search results.
+ * Keeps only essential fields to reduce token usage (~80% reduction).
+ */
+export function compactSearchResult(result, serverUrl) {
+    return {
+        count: result.count,
+        results: (result.results || []).map((rawPkg) => {
+            const pkg = serverUrl && requiresMultilingualNormalization(serverUrl) ? normalizePackage(rawPkg) : rawPkg;
+            return {
+                id: pkg.id,
+                name: pkg.name,
+                title: pkg.title || pkg.name,
+                notes: pkg.notes ? pkg.notes.substring(0, 200) + (pkg.notes.length > 200 ? '...' : '') : null,
+                organization: pkg.organization?.title || pkg.organization?.name || null,
+                tags: (pkg.tags || []).map((t) => t.name),
+                num_resources: pkg.num_resources ?? 0,
+                metadata_modified: pkg.metadata_modified,
+                ...(serverUrl ? { view_url: getDatasetViewUrl(serverUrl, pkg) } : {})
+            };
+        }),
+        ...(result.facets && Object.keys(result.facets).length > 0 ? { facets: result.facets } : {}),
+        ...(result.search_facets && Object.keys(result.search_facets).length > 0 ? { search_facets: result.search_facets } : {})
+    };
+}
+/**
+ * Compact JSON representation of package_show results.
+ * Keeps metadata + slim resources, drops extras/relationships/tracking.
+ */
+export function compactPackageShow(result, serverUrl) {
+    return {
+        id: result.id,
+        name: result.name,
+        title: result.title || result.name,
+        notes: result.notes || null,
+        organization: result.organization ? {
+            name: result.organization.name,
+            title: result.organization.title
+        } : null,
+        tags: (result.tags || []).map((t) => t.name),
+        state: result.state,
+        license_title: result.license_title || result.license_id || null,
+        metadata_created: result.metadata_created,
+        metadata_modified: result.metadata_modified,
+        issued: result.issued || null,
+        modified: result.modified || null,
+        author: result.author || null,
+        maintainer: result.maintainer || null,
+        frequency: result.frequency || null,
+        language: result.language || null,
+        publisher_name: result.publisher_name || null,
+        holder_name: result.holder_name || null,
+        hvd_category: result.hvd_category || null,
+        applicable_legislation: result.applicable_legislation || null,
+        resources: (result.resources || []).map((r) => ({
+            id: r.id,
+            name: r.name || null,
+            format: r.format || null,
+            url: r.url || null,
+            size: r.size || null,
+            datastore_active: r.datastore_active ?? null,
+            created: r.created || null,
+            last_modified: r.last_modified || null,
+            ...(serverUrl ? { api_json_url: `${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/resource_show?id=${r.id}` } : {})
+        })),
+        ...(serverUrl ? {
+            view_url: getDatasetViewUrl(serverUrl, result),
+            api_json_url: `${serverUrl.replace(/\/$/, '')}${getPortalApiPath(serverUrl)}/package_show?id=${result.id}`
+        } : {})
+    };
 }
 export function registerPackageTools(server) {
     /**
@@ -298,6 +481,12 @@ Args:
   - server_url (string): Base URL of CKAN server (e.g., "https://dati.gov.it/opendata")
   - q (string): Search query using Solr syntax (default: "*:*" for all)
   - fq (string): Filter query (e.g., "organization:comune-palermo")
+    IMPORTANT — Solr fq syntax rules:
+    1. OR inside a single field: use field:(val1 OR val2), NOT field:val1 OR field:val2.
+       Wrong: fq=type:"A" OR type:"B"  → silently ignored, returns entire catalog.
+       Right:  fq=type:("A" OR "B")
+    2. CKAN extras fields are indexed as extras_fieldname, not fieldname.
+       e.g. to filter on extra field "hvd_category" use fq=extras_hvd_category:"<value>"
   - rows (number): Number of results to return (default: 10, max: 1000)
   - start (number): Offset for pagination (default: 0)
   - page (number): Page number (1-based); alias for start. Overrides start if provided.
@@ -366,34 +555,36 @@ Examples:
   - Date range: { q: "metadata_modified:[2024-01-01T00:00:00Z TO 2024-12-31T23:59:59Z]" }
   - Date math: { q: "metadata_modified:[NOW-6MONTHS TO *]" }
   - Date math (auto-converted): { q: "modified:[NOW-30DAYS TO NOW]" }
+  - Published in 2025 (content date): { fq: "issued:[2025-01-01T00:00:00Z TO 2025-12-31T23:59:59Z]" }
+  - First appeared on portal in 2025: { fq: "metadata_created:[2025-01-01T00:00:00Z TO 2025-12-31T23:59:59Z]" }
   - Recent content (issued w/ fallback): { q: "*:*", content_recent: true, content_recent_days: 180 }
   - Field exists: { q: "organization:* AND num_resources:[1 TO *]" }
   - Boosting: { q: "title:climate^2 OR notes:climate" }
   - Filter org: { fq: "organization:regione-siciliana" }
+  - Filter extras field (correct): { fq: "extras_hvd_category:\"http://data.europa.eu/bna/c_ac64a52d\"" }
+  - Filter extras OR (correct): { fq: "extras_hvd_category:(\"http://data.europa.eu/bna/c_ac64a52d\" OR \"http://data.europa.eu/bna/c_dd313021\")" }
   - Get facets: { facet_field: ["organization"], rows: 0 }
 
 Typical workflow: ckan_package_search → ckan_package_show (get full metadata + resource IDs) → ckan_datastore_search (query tabular data)`,
         inputSchema: z.object({
             server_url: z.string()
                 .url("Must be a valid URL")
-                .optional()
-                .default(DEFAULT_CKAN_SERVER_URL)
-                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+                .describe("Base URL of the CKAN server"),
             q: z.string()
                 .optional()
                 .default("*:*")
                 .describe("Search query in Solr syntax"),
             fq: z.string()
                 .optional()
-                .describe("Filter query in Solr syntax; applied after scoring, does not affect relevance (e.g., 'organization:comune-palermo', 'res_format:CSV')"),
-            rows: z.number()
+                .describe("Filter query in Solr syntax; applied after scoring, does not affect relevance. CKAN extras fields use prefix 'extras_' (e.g. extras_hvd_category). For OR on same field use field:(val1 OR val2), never field:val1 OR field:val2 (silently breaks). Examples: 'organization:comune-palermo', 'res_format:CSV', 'extras_hvd_category:(\"uri1\" OR \"uri2\")'."),
+            rows: z.coerce.number()
                 .int()
                 .min(0)
                 .max(1000)
                 .optional()
                 .default(10)
                 .describe("Number of results to return"),
-            start: z.number()
+            start: z.coerce.number()
                 .int()
                 .min(0)
                 .optional()
@@ -405,18 +596,18 @@ Typical workflow: ckan_package_search → ckan_package_show (get full metadata +
             facet_field: z.array(z.string())
                 .optional()
                 .describe("Fields to facet on"),
-            facet_limit: z.number()
+            facet_limit: z.coerce.number()
                 .int()
                 .min(1)
                 .optional()
                 .default(50)
                 .describe("Maximum facet values per field"),
-            page: z.number()
+            page: z.coerce.number()
                 .int()
                 .min(1)
                 .optional()
                 .describe("Page number (1-based); alias for start. Overrides start if provided."),
-            page_size: z.number()
+            page_size: z.coerce.number()
                 .int()
                 .min(1)
                 .max(1000)
@@ -431,7 +622,7 @@ Typical workflow: ckan_package_search → ckan_package_show (get full metadata +
                 .optional()
                 .default(false)
                 .describe("Use issued date with fallback to metadata_created for recent content"),
-            content_recent_days: z.number()
+            content_recent_days: z.coerce.number()
                 .int()
                 .min(1)
                 .optional()
@@ -455,21 +646,33 @@ Typical workflow: ckan_package_search → ckan_package_show (get full metadata +
             let effectiveSort = params.sort;
             if (params.content_recent) {
                 const days = params.content_recent_days ?? 30;
-                const recentClause = `(issued:[NOW-${days}DAYS TO NOW]) OR (-issued:* AND metadata_created:[NOW-${days}DAYS TO NOW])`;
+                const daysAgo = new Date();
+                daysAgo.setUTCDate(daysAgo.getUTCDate() - days);
+                const daysAgoIso = daysAgo.toISOString();
+                const nowIso = new Date().toISOString();
+                const recentClause = `(issued:[${daysAgoIso} TO ${nowIso}]) OR (-issued:* AND metadata_created:[NOW-${days}DAYS TO NOW])`;
                 query = userQuery && userQuery !== "*:*" ? `(${userQuery}) AND (${recentClause})` : recentClause;
                 if (!effectiveSort)
                     effectiveSort = "issued desc, metadata_created desc";
             }
-            const { effectiveQuery } = resolveSearchQuery(params.server_url, query, params.query_parser);
+            // For portals not explicitly configured in portals.json, auto-detect
+            // whether they need text:(...) wrapping by probing with a two-term OR query.
+            let parserOverride = params.query_parser;
+            if (!parserOverride && !isPortalSearchExplicitlyConfigured(params.server_url)) {
+                const needsText = await probePortalParser(params.server_url);
+                if (needsText)
+                    parserOverride = "text";
+            }
+            const { effectiveQuery } = resolveSearchQuery(params.server_url, query, parserOverride);
             const { effectiveRows, effectiveStart } = resolvePageParams(params.page, params.page_size, params.start, params.rows);
             const apiParams = {
-                q: effectiveQuery,
+                q: convertNowForExtraFields(effectiveQuery),
                 rows: effectiveRows,
                 start: effectiveStart,
                 include_private: params.include_drafts
             };
             if (params.fq)
-                apiParams.fq = params.fq;
+                apiParams.fq = convertNowForExtraFields(params.fq);
             if (effectiveSort)
                 apiParams.sort = effectiveSort;
             if (params.facet_field && params.facet_field.length > 0) {
@@ -488,9 +691,29 @@ Typical workflow: ckan_package_search → ckan_package_show (get full metadata +
                 }
             }
             if (params.response_format === ResponseFormat.JSON) {
+                const compact = compactSearchResult(result, params.server_url);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }]
+                    content: [{ type: "text", text: truncateJson(compact) }]
                 };
+            }
+            // HVD note: only on synthesis queries (q=*:* + facets or rows=0) in markdown mode
+            let hvdNote = '';
+            const isSynthesisQuery = (params.q === '*:*' || params.q === undefined) &&
+                (effectiveRows === 0 ||
+                    (params.facet_field && params.facet_field.some((f) => ['organization', 'tags', 'groups', 'res_format'].includes(f))));
+            if (isSynthesisQuery) {
+                const hvdConfig = getPortalHvdConfig(params.server_url);
+                if (hvdConfig) {
+                    try {
+                        const hvdResult = await makeCkanRequest(params.server_url, 'package_search', { q: `${hvdConfig.category_field}:*`, rows: 0 });
+                        if (hvdResult.count > 0) {
+                            hvdNote = `> **High Value Datasets (HVD)**: This portal contains **${hvdResult.count} datasets** classified as High Value Datasets under EU Regulation 2023/138.\n\n`;
+                        }
+                    }
+                    catch {
+                        // silently skip if HVD query fails
+                    }
+                }
             }
             // Markdown format
             let markdown = `# CKAN Package Search Results
@@ -504,7 +727,7 @@ ${params.fq ? `**Filter**: ${params.fq}\n` : ''}
 **Total Results**: ${result.count}
 **Showing**: ${result.results.length} results (from ${effectiveStart})
 
-`;
+${hvdNote}`;
             // Show facets if available
             if (result.facets && Object.keys(result.facets).length > 0) {
                 markdown += `## Facets\n\n`;
@@ -529,7 +752,8 @@ ${params.fq ? `**Filter**: ${params.fq}\n` : ''}
             // Show results
             if (result.results && result.results.length > 0) {
                 markdown += `## Datasets\n\n`;
-                for (const pkg of result.results) {
+                for (const rawPkg of result.results) {
+                    const pkg = requiresMultilingualNormalization(params.server_url) ? normalizePackage(rawPkg) : rawPkg;
                     markdown += `### ${pkg.title || pkg.name}\n\n`;
                     markdown += `- **ID**: \`${pkg.id}\`\n`;
                     markdown += `- **Name**: \`${pkg.name}\`\n`;
@@ -551,6 +775,7 @@ ${params.fq ? `**Filter**: ${params.fq}\n` : ''}
             }
             else {
                 markdown += `No datasets found matching your query.\n`;
+                markdown += `\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n`;
                 if (isPlainMultiTermQuery(params.q)) {
                     markdown += `\n> **Tip**: Multi-term queries use AND by default (all terms must match). Try OR to broaden the search:\n`;
                     markdown += `> \`q: "${buildOrQuery(params.q)}"\`\n`;
@@ -612,13 +837,11 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
         inputSchema: z.object({
             server_url: z.string()
                 .url()
-                .optional()
-                .default(DEFAULT_CKAN_SERVER_URL)
-                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+                .describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             query: z.string()
                 .min(2)
                 .describe("Natural language or keyword query to match against dataset title, notes, tags, and organization"),
-            limit: z.number()
+            limit: z.coerce.number()
                 .int()
                 .min(1)
                 .max(50)
@@ -626,10 +849,10 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
                 .default(10)
                 .describe("Number of datasets to return"),
             weights: z.object({
-                title: z.number().min(0).optional().describe("Weight for title match (default 4)"),
-                notes: z.number().min(0).optional().describe("Weight for description match (default 2)"),
-                tags: z.number().min(0).optional().describe("Weight for tag match (default 3)"),
-                organization: z.number().min(0).optional().describe("Weight for organization match (default 1)")
+                title: z.coerce.number().min(0).optional().describe("Weight for title match (default 4)"),
+                notes: z.coerce.number().min(0).optional().describe("Weight for description match (default 2)"),
+                tags: z.coerce.number().min(0).optional().describe("Weight for tag match (default 3)"),
+                organization: z.coerce.number().min(0).optional().describe("Weight for organization match (default 1)")
             }).optional().describe("Per-field scoring weights; unspecified fields use defaults"),
             query_parser: z.enum(["default", "text"])
                 .optional()
@@ -704,6 +927,7 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
             markdown += `- **Organization**: ${weights.organization}\n\n`;
             if (top.length === 0) {
                 markdown += 'No datasets matched the query terms.\n';
+                markdown += `\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n`;
             }
             else {
                 markdown += `## Results\n\n`;
@@ -758,8 +982,14 @@ Args:
   - include_tracking (boolean): Include view/download statistics (default: false)
   - response_format ('markdown' | 'json'): Output format
 
-Returns:
-  Complete dataset object with all metadata and resources
+Returns (JSON format):
+  id, name, title, notes, organization, tags, state, license_title,
+  metadata_created, metadata_modified, issued, modified,
+  author, maintainer,
+  frequency, language, publisher_name, holder_name,
+  hvd_category, applicable_legislation,
+  resources (id, name, format, url, size, datastore_active, created, last_modified, api_json_url),
+  view_url, api_json_url
 
 Examples:
   - { server_url: "https://dati.gov.it/opendata", id: "dataset-name" }
@@ -769,9 +999,7 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
         inputSchema: z.object({
             server_url: z.string()
                 .url()
-                .optional()
-                .default(DEFAULT_CKAN_SERVER_URL)
-                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+                .describe("Base URL of the CKAN server"),
             id: z.string()
                 .min(1)
                 .describe("Dataset ID or name"),
@@ -794,10 +1022,10 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
                 include_tracking: params.include_tracking
             });
             if (params.response_format === ResponseFormat.JSON) {
-                const enriched = enrichPackageShowResult(result);
+                const compact = compactPackageShow(enrichPackageShowResult(result), params.server_url);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(enriched, null, 2)) }],
-                    structuredContent: enriched
+                    content: [{ type: "text", text: truncateJson(compact) }],
+                    structuredContent: compact
                 };
             }
             const markdown = formatPackageShowMarkdown(result, params.server_url);
@@ -842,9 +1070,7 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
         inputSchema: z.object({
             server_url: z.string()
                 .url()
-                .optional()
-                .default(DEFAULT_CKAN_SERVER_URL)
-                .describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+                .describe("Base URL of the CKAN server"),
             id: z.string()
                 .min(1)
                 .describe("Dataset ID or name"),
@@ -902,6 +1128,7 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
             markdown += `\n\n`;
             if (summary.length === 0) {
                 markdown += `No resources found in this dataset.\n`;
+                markdown += `\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n`;
             }
             else {
                 markdown += `| Name | Format | Size | DataStore | ID |\n`;

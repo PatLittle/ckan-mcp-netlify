@@ -1,6 +1,6 @@
 {
   "repo": "https://github.com/ondata/ckan-mcp-server",
-  "commit": "747aaf7b86c98a1305adc8ef7d07b7c87696cf16",
-  "date": "2026-02-26 18:54:20 +0100",
-  "version": "0.4.50"
+  "commit": "68fd6cad670b8e9837a1cbd5511c031dfd220cd8",
+  "date": "2026-03-21 10:02:23 +0000",
+  "version": "0.4.89"
 }

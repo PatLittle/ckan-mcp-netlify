@@ -3,8 +3,21 @@
  */
 import { z } from "zod";
 import { makeCkanRequest } from "../utils/http.js";
-import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
 import { addDemoFooter } from "../utils/formatting.js";
+import { getPortalSparqlConfig, getPortalHvdConfig } from "../utils/portal-config.js";
+export function formatStatusMarkdown(result, serverUrl, hvdCount) {
+    const sparql = getPortalSparqlConfig(serverUrl);
+    const sparqlLine = sparql ? `**SPARQL Endpoint**: ${sparql.endpoint_url}\n` : "";
+    const hvdLine = hvdCount !== undefined ? `**HVD Datasets**: ${hvdCount}\n` : "";
+    return `# CKAN Server Status\n\n` +
+        `**Server**: ${serverUrl}\n` +
+        `**Status**: ✅ Online\n` +
+        `**CKAN Version**: ${result.ckan_version || 'Unknown'}\n` +
+        `**Site Title**: ${result.site_title || 'N/A'}\n` +
+        `**Site URL**: ${result.site_url || 'N/A'}\n` +
+        sparqlLine +
+        hvdLine;
+}
 export function registerStatusTools(server) {
     /**
      * Check CKAN server status
@@ -14,16 +27,17 @@ export function registerStatusTools(server) {
         description: `Check if a CKAN server is available and get version information.
 
 Useful to verify server accessibility before making other requests.
+Also shows the count of High-Value Datasets (HVD) when the portal supports it.
 
 Args:
   - server_url (string): Base URL of CKAN server
 
 Returns:
-  Server status and version information
+  Server status, version information, and HVD dataset count (if available)
 
 Typical workflow: ckan_status_show (verify server is up) → ckan_package_search (discover datasets)`,
         inputSchema: z.object({
-            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)")
+            server_url: z.string().url().describe("Base URL of the CKAN server")
         }).strict(),
         annotations: {
             readOnlyHint: true,
@@ -33,13 +47,16 @@ Typical workflow: ckan_status_show (verify server is up) → ckan_package_search
         }
     }, async (params) => {
         try {
-            const result = await makeCkanRequest(params.server_url, 'status_show', {});
-            const markdown = `# CKAN Server Status\n\n` +
-                `**Server**: ${params.server_url}\n` +
-                `**Status**: ✅ Online\n` +
-                `**CKAN Version**: ${result.ckan_version || 'Unknown'}\n` +
-                `**Site Title**: ${result.site_title || 'N/A'}\n` +
-                `**Site URL**: ${result.site_url || 'N/A'}\n`;
+            const hvdConfig = getPortalHvdConfig(params.server_url);
+            const [result, hvdCount] = await Promise.all([
+                makeCkanRequest(params.server_url, 'status_show', {}),
+                hvdConfig
+                    ? makeCkanRequest(params.server_url, 'package_search', { fq: `${hvdConfig.category_field}:*`, rows: 0 })
+                        .then((r) => r.count)
+                        .catch(() => undefined)
+                    : Promise.resolve(undefined)
+            ]);
+            const markdown = formatStatusMarkdown(result, params.server_url, hvdCount);
             return {
                 content: [{ type: "text", text: addDemoFooter(markdown) }],
                 structuredContent: result

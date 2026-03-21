@@ -4,9 +4,87 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { DEFAULT_CKAN_SERVER_URL } from "../utils/constants.js";
-import { truncateText, formatDate, addDemoFooter } from "../utils/formatting.js";
+import { truncateText, truncateJson, formatDate, addDemoFooter } from "../utils/formatting.js";
 import { getOrganizationViewUrl } from "../utils/url-generator.js";
+export function formatOrganizationShowMarkdown(result, serverUrl) {
+    let markdown = `# Organization: ${result.title || result.name}\n\n`;
+    markdown += `**Server**: ${serverUrl}\n`;
+    markdown += `**Link**: ${getOrganizationViewUrl(serverUrl, result)}\n\n`;
+    markdown += `## Details\n\n`;
+    markdown += `- **ID**: \`${result.id}\`\n`;
+    markdown += `- **Name**: \`${result.name}\`\n`;
+    markdown += `- **Datasets**: ${result.package_count || 0}\n`;
+    markdown += `- **Created**: ${formatDate(result.created)}\n`;
+    markdown += `- **State**: ${result.state}\n\n`;
+    if (result.description) {
+        markdown += `## Description\n\n${result.description}\n\n`;
+    }
+    if (result.packages && result.packages.length > 0) {
+        const displayed = Math.min(result.packages.length, 20);
+        const totalHint = result.package_count && result.package_count !== result.packages.length
+            ? ` — ${result.package_count} total`
+            : '';
+        markdown += `## Datasets (showing ${displayed} of ${result.packages.length} returned${totalHint})\n\n`;
+        for (const pkg of result.packages.slice(0, 20)) {
+            markdown += `- **${pkg.title || pkg.name}** (\`${pkg.name}\`)\n`;
+        }
+        if (result.packages.length > 20) {
+            markdown += `\n... and ${result.packages.length - 20} more datasets\n`;
+        }
+        markdown += '\n';
+    }
+    if (result.users && result.users.length > 0) {
+        markdown += `## Users (${result.users.length})\n\n`;
+        for (const user of result.users) {
+            markdown += `- **${user.name}** (${user.capacity})\n`;
+        }
+        markdown += '\n';
+    }
+    return markdown;
+}
+/**
+ * Compact JSON for organization_list results.
+ * When all_fields=true, keeps only essential fields per org.
+ */
+export function compactOrganizationList(result) {
+    if (!Array.isArray(result))
+        return result;
+    return {
+        count: result.length,
+        organizations: result.map((org) => {
+            if (typeof org === 'string')
+                return org;
+            return {
+                id: org.id,
+                name: org.name,
+                title: org.title || org.name,
+                package_count: org.package_count ?? 0
+            };
+        })
+    };
+}
+/**
+ * Compact JSON for organization_show results.
+ * Keeps org metadata + slim package list, drops extras/users/groups.
+ */
+export function compactOrganizationShow(result, serverUrl) {
+    return {
+        id: result.id,
+        name: result.name,
+        title: result.title || result.name,
+        description: result.description || null,
+        image_url: result.image_url || null,
+        package_count: result.package_count ?? 0,
+        created: result.created || null,
+        view_url: getOrganizationViewUrl(serverUrl, result),
+        packages: (result.packages || []).map((pkg) => ({
+            id: pkg.id,
+            name: pkg.name,
+            title: pkg.title || pkg.name,
+            metadata_modified: pkg.metadata_modified || null
+        }))
+    };
+}
 export function registerOrganizationTools(server) {
     /**
      * List all organizations
@@ -30,11 +108,11 @@ Returns:
 
 Typical workflow: ckan_organization_list → ckan_organization_show (inspect one) → ckan_package_search with fq="organization:name" (browse its datasets)`,
         inputSchema: z.object({
-            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             all_fields: z.boolean().optional().default(false).describe("Return full organization objects (true) or just name slugs (false)"),
             sort: z.string().optional().default("name asc").describe("Sort field and direction (e.g., 'name asc', 'package_count desc')"),
-            limit: z.number().int().min(0).optional().default(100).describe("Max organizations to return. Use 0 to get only the count via faceting"),
-            offset: z.number().int().min(0).optional().default(0).describe("Pagination offset"),
+            limit: z.coerce.number().int().min(0).optional().default(100).describe("Max organizations to return. Use 0 to get only the count via faceting"),
+            offset: z.coerce.number().int().min(0).optional().default(0).describe("Pagination offset"),
             response_format: ResponseFormatSchema
         }).strict(),
         annotations: {
@@ -103,7 +181,7 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
                     if (params.response_format === ResponseFormat.JSON) {
                         const output = { count: items.length, organizations };
                         return {
-                            content: [{ type: "text", text: truncateText(JSON.stringify(output, null, 2)) }],
+                            content: [{ type: "text", text: truncateJson(output) }],
                             structuredContent: output
                         };
                     }
@@ -124,12 +202,10 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
                 throw error;
             }
             if (params.response_format === ResponseFormat.JSON) {
-                const output = Array.isArray(result)
-                    ? { count: result.length, organizations: result }
-                    : result;
+                const compact = compactOrganizationList(result);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(output, null, 2)) }],
-                    structuredContent: output
+                    content: [{ type: "text", text: truncateJson(compact) }],
+                    structuredContent: compact
                 };
             }
             let markdown = `# CKAN Organizations\n\n`;
@@ -185,7 +261,7 @@ Returns:
 
 Typical workflow: ckan_organization_show → ckan_package_show (inspect a dataset) → ckan_datastore_search (query its data)`,
         inputSchema: z.object({
-            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             id: z.string().min(1).describe("Organization ID (UUID) or machine-readable name slug (e.g., 'regione-siciliana')"),
             include_datasets: z.boolean().optional().default(true).describe("Include the list of datasets published by this organization"),
             include_users: z.boolean().optional().default(false).describe("Include the list of users belonging to this organization"),
@@ -205,40 +281,13 @@ Typical workflow: ckan_organization_show → ckan_package_show (inspect a datase
                 include_users: params.include_users
             });
             if (params.response_format === ResponseFormat.JSON) {
+                const compact = compactOrganizationShow(result, params.server_url);
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(result, null, 2)) }],
-                    structuredContent: result
+                    content: [{ type: "text", text: truncateJson(compact) }],
+                    structuredContent: compact
                 };
             }
-            let markdown = `# Organization: ${result.title || result.name}\n\n`;
-            markdown += `**Server**: ${params.server_url}\n`;
-            markdown += `**Link**: ${getOrganizationViewUrl(params.server_url, result)}\n\n`;
-            markdown += `## Details\n\n`;
-            markdown += `- **ID**: \`${result.id}\`\n`;
-            markdown += `- **Name**: \`${result.name}\`\n`;
-            markdown += `- **Datasets**: ${result.package_count || 0}\n`;
-            markdown += `- **Created**: ${formatDate(result.created)}\n`;
-            markdown += `- **State**: ${result.state}\n\n`;
-            if (result.description) {
-                markdown += `## Description\n\n${result.description}\n\n`;
-            }
-            if (result.packages && result.packages.length > 0) {
-                markdown += `## Datasets (${result.packages.length})\n\n`;
-                for (const pkg of result.packages.slice(0, 20)) {
-                    markdown += `- **${pkg.title || pkg.name}** (\`${pkg.name}\`)\n`;
-                }
-                if (result.packages.length > 20) {
-                    markdown += `\n... and ${result.packages.length - 20} more datasets\n`;
-                }
-                markdown += '\n';
-            }
-            if (result.users && result.users.length > 0) {
-                markdown += `## Users (${result.users.length})\n\n`;
-                for (const user of result.users) {
-                    markdown += `- **${user.name}** (${user.capacity})\n`;
-                }
-                markdown += '\n';
-            }
+            const markdown = formatOrganizationShowMarkdown(result, params.server_url);
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
@@ -277,7 +326,7 @@ Examples:
 
 Typical workflow: ckan_organization_search → ckan_organization_show (get details) → ckan_package_search with fq="organization:name"`,
         inputSchema: z.object({
-            server_url: z.string().url().optional().default(DEFAULT_CKAN_SERVER_URL).describe("Base URL of the CKAN server (default: https://open.canada.ca/data)"),
+            server_url: z.string().url().describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             pattern: z.string().min(1).describe("Name pattern to search for (wildcards added automatically, e.g., 'toscana', 'health')"),
             response_format: ResponseFormatSchema
         }).strict(),
@@ -289,8 +338,8 @@ Typical workflow: ckan_organization_search → ckan_organization_show (get detai
         }
     }, async (params) => {
         try {
-            // Build Solr query with wildcards
-            const query = `organization:*${params.pattern}*`;
+            // Build Solr query with wildcards (lowercase: Solr org names are always lowercase)
+            const query = `organization:*${params.pattern.toLowerCase()}*`;
             // Search using package_search with faceting
             const result = await makeCkanRequest(params.server_url, 'package_search', {
                 q: query,
@@ -308,7 +357,8 @@ Typical workflow: ckan_organization_search → ckan_organization_show (get detai
                     organizations: orgFacets.map((item) => ({
                         name: item.name,
                         display_name: item.display_name,
-                        dataset_count: item.count
+                        dataset_count: item.count,
+                        view_url: getOrganizationViewUrl(params.server_url, { name: item.name })
                     }))
                 };
                 return {
@@ -324,13 +374,15 @@ Typical workflow: ckan_organization_search → ckan_organization_show (get detai
             markdown += `**Total Datasets**: ${totalDatasets}\n\n`;
             if (orgFacets.length === 0) {
                 markdown += `No organizations found matching pattern "${params.pattern}".\n`;
+                markdown += `\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n`;
             }
             else {
                 markdown += `## Matching Organizations\n\n`;
-                markdown += `| Organization | Datasets |\n`;
-                markdown += `|--------------|----------|\n`;
+                markdown += `| Organization | Datasets | Link |\n`;
+                markdown += `|--------------|----------|------|\n`;
                 for (const org of orgFacets) {
-                    markdown += `| ${org.display_name || org.name} | ${org.count} |\n`;
+                    const viewUrl = getOrganizationViewUrl(params.server_url, { name: org.name });
+                    markdown += `| ${org.display_name || org.name} | ${org.count} | ${viewUrl} |\n`;
                 }
             }
             return {

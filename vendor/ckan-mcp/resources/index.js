@@ -6,8 +6,9 @@
 import { registerDatasetResource } from "./dataset.js";
 import { registerResourceResource } from "./resource.js";
 import { registerOrganizationResource } from "./organization.js";
-import { registerFormatDatasetsResource, registerOrganizationDatasetsResource } from "./dataset-filters.js";
-import { registerDatastoreTableUiResource } from "./datastore-table-ui.js";
+import { registerFormatDatasetsResource, registerGroupDatasetsResource, registerOrganizationDatasetsResource, registerTagDatasetsResource } from "./dataset-filters.js";
+// DataStore Table UI disabled - awaiting use-case design
+// import { registerDatastoreTableUiResource } from "./datastore-table-ui.js";
 /**
  * Register all CKAN resource templates
  */
@@ -15,7 +16,9 @@ export function registerAllResources(server) {
     registerDatasetResource(server);
     registerResourceResource(server);
     registerOrganizationResource(server);
+    registerGroupDatasetsResource(server);
     registerOrganizationDatasetsResource(server);
+    registerTagDatasetsResource(server);
     registerFormatDatasetsResource(server);
-    registerDatastoreTableUiResource(server);
+    // registerDatastoreTableUiResource(server);
 }
