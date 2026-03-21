@@ -8,12 +8,115 @@ WORK_DIR="$(mktemp -d)"
 BUILD_DIR="$ROOT_DIR/.vendor-refresh-src"
 SRC_DIR="$BUILD_DIR/src"
 OUT_DIR="$WORK_DIR/out"
+CUSTOM_SNAPSHOT_DIR="$WORK_DIR/custom-overrides"
+
+SCHEMING_TOOL_PATH="vendor/ckan-mcp/tools/scheming.js"
+SERVER_PATH="vendor/ckan-mcp/server.js"
+CORS_PROXY_PATH="netlify/functions/cors-proxy.mjs"
+
+snapshot_custom_overrides() {
+  mkdir -p "$CUSTOM_SNAPSHOT_DIR"
+
+  if [[ -f "$ROOT_DIR/$SCHEMING_TOOL_PATH" ]]; then
+    cp "$ROOT_DIR/$SCHEMING_TOOL_PATH" "$CUSTOM_SNAPSHOT_DIR/scheming.js"
+    echo "Captured custom scheming endpoint overrides."
+  fi
+
+  # This file is outside the vendor directory, but snapshot it in case future
+  # refresh steps start touching function files.
+  if [[ -f "$ROOT_DIR/$CORS_PROXY_PATH" ]]; then
+    cp "$ROOT_DIR/$CORS_PROXY_PATH" "$CUSTOM_SNAPSHOT_DIR/cors-proxy.mjs"
+    echo "Captured custom CORS proxy function."
+  fi
+}
+
+ensure_scheming_registration() {
+  local server_file="$ROOT_DIR/$SERVER_PATH"
+  if [[ ! -f "$server_file" ]]; then
+    echo "Skipping scheming registration patch: missing $SERVER_PATH"
+    return 0
+  fi
+
+  SERVER_FILE="$server_file" node --input-type=module <<'EOF'
+import fs from "node:fs";
+
+const serverFile = process.env.SERVER_FILE;
+let source = fs.readFileSync(serverFile, "utf8");
+let changed = false;
+
+const importLine = 'import { registerSchemingTools } from "./tools/scheming.js";';
+if (!source.includes(importLine)) {
+  const lines = source.split("\n");
+  const datastoreImportIndex = lines.findIndex((line) => line.includes("registerDatastoreTools"));
+  const importIndexes = lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => line.startsWith("import "))
+    .map(({ index }) => index);
+  const lastImportIndex = importIndexes.length ? importIndexes[importIndexes.length - 1] : -1;
+  const insertIndex = datastoreImportIndex >= 0 ? datastoreImportIndex + 1 : lastImportIndex + 1;
+  lines.splice(insertIndex, 0, importLine);
+  source = lines.join("\n");
+  changed = true;
+}
+
+if (!source.includes("registerSchemingTools(server);")) {
+  const lines = source.split("\n");
+  const datastoreCallIndex = lines.findIndex((line) => line.includes("registerDatastoreTools(server);"));
+  const statusCallIndex = lines.findIndex((line) => line.includes("registerStatusTools(server);"));
+
+  if (datastoreCallIndex >= 0) {
+    const indent = (lines[datastoreCallIndex].match(/^(\s*)/) || ["", ""])[1];
+    lines.splice(datastoreCallIndex + 1, 0, `${indent}registerSchemingTools(server);`);
+    source = lines.join("\n");
+    changed = true;
+  } else if (statusCallIndex >= 0) {
+    const indent = (lines[statusCallIndex].match(/^(\s*)/) || ["", ""])[1];
+    lines.splice(statusCallIndex, 0, `${indent}registerSchemingTools(server);`);
+    source = lines.join("\n");
+    changed = true;
+  } else {
+    const registerAllIndex = lines.findIndex((line) => line.includes("export function registerAll("));
+    if (registerAllIndex >= 0) {
+      let insertIndex = registerAllIndex + 1;
+      while (insertIndex < lines.length && lines[insertIndex].trim() === "") {
+        insertIndex += 1;
+      }
+      lines.splice(insertIndex, 0, "  registerSchemingTools(server);");
+      source = lines.join("\n");
+      changed = true;
+    }
+  }
+}
+
+if (changed) {
+  fs.writeFileSync(serverFile, source);
+  console.log("Applied custom scheming registration to vendor/ckan-mcp/server.js");
+}
+EOF
+}
+
+restore_custom_overrides() {
+  if [[ -f "$CUSTOM_SNAPSHOT_DIR/scheming.js" ]]; then
+    mkdir -p "$(dirname "$ROOT_DIR/$SCHEMING_TOOL_PATH")"
+    cp "$CUSTOM_SNAPSHOT_DIR/scheming.js" "$ROOT_DIR/$SCHEMING_TOOL_PATH"
+    echo "Restored custom scheming endpoint file."
+    ensure_scheming_registration
+  fi
+
+  if [[ -f "$CUSTOM_SNAPSHOT_DIR/cors-proxy.mjs" ]]; then
+    mkdir -p "$(dirname "$ROOT_DIR/$CORS_PROXY_PATH")"
+    cp "$CUSTOM_SNAPSHOT_DIR/cors-proxy.mjs" "$ROOT_DIR/$CORS_PROXY_PATH"
+    echo "Restored custom CORS proxy function."
+  fi
+}
 
 cleanup() {
   rm -rf "$WORK_DIR"
   rm -rf "$BUILD_DIR"
 }
 trap cleanup EXIT
+
+snapshot_custom_overrides
 
 echo "Cloning upstream: $UPSTREAM_REPO"
 git clone --depth 1 "$UPSTREAM_REPO" "$WORK_DIR/repo" >/dev/null
@@ -64,6 +167,8 @@ rsync -a --delete "$OUT_DIR/" "$ROOT_DIR/vendor/ckan-mcp/"
 sed -i "s/assert { type: 'json' }/with { type: \"json\" }/g" \
   "$ROOT_DIR/vendor/ckan-mcp/utils/portal-config.js" \
   "$ROOT_DIR/vendor/ckan-mcp/utils/url-generator.js" || true
+
+restore_custom_overrides
 
 cat > "$ROOT_DIR/vendor/ckan-mcp/.upstream.json" <<EOF
 {
