@@ -48,4 +48,7 @@ Commits: `0b6afd3`, `53e7992`
 - Added new MCP capabilities for dataset analysis, CKAN portal discovery, SPARQL querying, and HVD-focused prompting.
 - Extended the existing package, organization, group, tag, datastore, quality, and status tools while also updating shared formatting, HTTP, portal configuration, and portal registry data.
 - Refreshed `vendor/ckan-mcp/portals.json` and widened the server's open-data coverage from CKAN catalog access into broader discovery and analysis workflows.
+- Enabled the dedicated DataStore table UI resource so MCP clients can render query results through the `ui://ckan/datastore-table` app view instead of only text output.
+- Removed SQL DataStore tool exposure from the MCP surface after confirming Open Canada does not support `ckan.datastore.sqlsearch.enabled`.
+- Added `ckan_datastore_info` to expose DataStore row counts, table/database/index sizes, aliases, and detailed field metadata including schema and labels.
 - Result: the project evolved into a more complete open-data research toolkit, covering portal discovery, metadata inspection, tabular querying, and linked-data querying from a single Netlify-hosted MCP server.
