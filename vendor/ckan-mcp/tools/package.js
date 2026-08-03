@@ -3,9 +3,9 @@
  */
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
-import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, truncateJson, formatDate, formatBytes, addDemoFooter } from "../utils/formatting.js";
-import { getDatasetViewUrl } from "../utils/url-generator.js";
+import { makeCkanRequest, formatCkanError } from "../utils/http.js";
+import { truncateText, truncateJson, formatDate, formatBytes, addDemoFooter, wrapUntrusted, safeUrlText, formatError, jsonToolResult } from "../utils/formatting.js";
+import { getDatasetViewUrl, extractSourcePortal } from "../utils/url-generator.js";
 import { resolveSearchQuery, stripAccents, hasAccents, isPlainMultiTermQuery, buildOrQuery } from "../utils/search.js";
 import { getPortalHvdConfig, getPortalApiPath, requiresMultilingualNormalization, isPortalSearchExplicitlyConfigured } from "../utils/portal-config.js";
 /**
@@ -39,7 +39,9 @@ const DEFAULT_RELEVANCE_WEIGHTS = {
     title: 4,
     notes: 2,
     tags: 3,
-    organization: 1
+    organization: 1,
+    holder: 4,
+    publisher: 2
 };
 const QUERY_STOPWORDS = new Set([
     "a",
@@ -99,16 +101,54 @@ export const textMatchesTerms = (text, terms) => {
 export const scoreTextField = (text, terms, weight) => {
     return textMatchesTerms(text, terms) ? weight : 0;
 };
+/**
+ * Read a DCAT-AP_IT field (e.g. `holder_name`, `publisher_name`) from a CKAN dataset.
+ *
+ * On Italian DCAT-AP_IT portals (notably dati.gov.it via ckanext-dcatapit), `package_search`
+ * results expose DCAT fields in TWO places that often disagree:
+ *
+ *   1. Inside `extras[]` as `{ key, value }` pairs → this is the authoritative DCAT-AP_IT
+ *      source: `dct:rightsHolder` ends up under `extras[].key === "holder_name"`,
+ *      `dct:publisher` under `extras[].key === "publisher_name"`. These are the values the
+ *      data publisher set, mapped from the upstream RDF.
+ *
+ *   2. As root-level fields (`dataset.holder_name`, `dataset.publisher_name`) → on aggregator
+ *      catalogs, ckanext-dcatapit "promotes" the organization metadata into these root fields
+ *      during harvesting. For datasets harvested via a regional/GAL/Unione catalog, the root
+ *      value reflects the HARVESTER, not the data owner. Example on dati.gov.it: dataset
+ *      `defibrillatori-esterni` has `extras.holder_name = "Comune di Mesagne"` (correct) but
+ *      root `holder_name = "GAL Terra dei Messapi"` (wrong owner — that's the harvester).
+ *
+ * This helper prefers `extras[]` (DCAT-AP_IT truth) and falls back to the root field only
+ * when extras don't carry the key. The fallback is important for non-DCAT-AP_IT CKAN portals
+ * (e.g. data.gov, open.canada.ca) where root-level holder/publisher are correct.
+ */
+export const readDcatExtra = (dataset, key) => {
+    const extras = Array.isArray(dataset.extras) ? dataset.extras : [];
+    for (const e of extras) {
+        if (e && typeof e === "object" && e.key === key) {
+            const value = e.value;
+            if (typeof value === "string" && value.length > 0)
+                return value;
+        }
+    }
+    const rootValue = dataset[key];
+    return typeof rootValue === "string" ? rootValue : "";
+};
 export const scoreDatasetRelevance = (query, dataset, weights = DEFAULT_RELEVANCE_WEIGHTS) => {
     const terms = extractQueryTerms(query);
     const titleText = dataset.title || dataset.name || "";
     const notesText = dataset.notes || "";
     const orgText = dataset.organization?.title || dataset.organization?.name || dataset.owner_org || "";
+    const holderText = readDcatExtra(dataset, "holder_name");
+    const publisherText = readDcatExtra(dataset, "publisher_name");
     const breakdown = {
         title: scoreTextField(titleText, terms, weights.title),
         notes: scoreTextField(notesText, terms, weights.notes),
         tags: 0,
         organization: scoreTextField(orgText, terms, weights.organization),
+        holder: scoreTextField(holderText, terms, weights.holder),
+        publisher: scoreTextField(publisherText, terms, weights.publisher),
         total: 0
     };
     if (Array.isArray(dataset.tags) && dataset.tags.length > 0 && terms.length > 0) {
@@ -118,7 +158,13 @@ export const scoreDatasetRelevance = (query, dataset, weights = DEFAULT_RELEVANC
         });
         breakdown.tags = tagMatch ? weights.tags : 0;
     }
-    breakdown.total = breakdown.title + breakdown.notes + breakdown.tags + breakdown.organization;
+    breakdown.total =
+        breakdown.title +
+            breakdown.notes +
+            breakdown.tags +
+            breakdown.organization +
+            breakdown.holder +
+            breakdown.publisher;
     return { total: breakdown.total, breakdown, terms };
 };
 export const parseAccessServices = (resource) => {
@@ -207,14 +253,33 @@ export const formatPackageShowMarkdown = (result, serverUrl) => {
     }
     if (result.modified)
         markdown += `- **Modified (Content)**: ${formatDate(result.modified)}\n`;
-    markdown += `- **Metadata Modified (Record)**: ${formatDate(result.metadata_modified)}\n\n`;
+    markdown += `- **Metadata Modified (Record)**: ${formatDate(result.metadata_modified)}\n`;
+    // DCAT-AP fields returned natively by package_show but not otherwise surfaced.
+    // holder/publisher via readDcatExtra (extras override root on aggregators); the rest read root.
+    const holderName = readDcatExtra(result, "holder_name");
+    if (holderName)
+        markdown += `- **Rights Holder (dct:rightsHolder)**: ${holderName}\n`;
+    const publisherName = readDcatExtra(result, "publisher_name");
+    if (publisherName)
+        markdown += `- **Publisher (dct:publisher)**: ${publisherName}\n`;
+    const dcatField = (key) => typeof result[key] === "string" ? result[key] : "";
+    const frequency = dcatField("frequency");
+    if (frequency)
+        markdown += `- **Update Frequency (dct:accrualPeriodicity)**: ${frequency}\n`;
+    const language = dcatField("language");
+    if (language)
+        markdown += `- **Language (dct:language)**: ${language}\n`;
+    const accessRights = dcatField("access_rights");
+    if (accessRights)
+        markdown += `- **Access Rights (dct:accessRights)**: ${accessRights}\n`;
+    markdown += `\n`;
     if (result.organization) {
         markdown += `## Organization\n\n`;
         markdown += `- **Name**: ${result.organization.title || result.organization.name}\n`;
         markdown += `- **ID**: \`${result.organization.id}\`\n\n`;
     }
     if (result.notes) {
-        markdown += `## Description\n\n${result.notes}\n\n`;
+        markdown += `## Description\n\n${wrapUntrusted(result.notes)}\n\n`;
     }
     if (result.tags && result.tags.length > 0) {
         markdown += `## Tags\n\n`;
@@ -234,8 +299,8 @@ export const formatPackageShowMarkdown = (result, serverUrl) => {
             markdown += `- **ID**: \`${resource.id}\`\n`;
             markdown += `- **Format**: ${resource.format || 'Unknown'}\n`;
             if (resource.description)
-                markdown += `- **Description**: ${resource.description}\n`;
-            markdown += `- **URL**: ${resource.url}\n`;
+                markdown += `- **Description**:\n\n${wrapUntrusted(resource.description)}\n\n`;
+            markdown += `- **URL**: ${safeUrlText(resource.url)}\n`;
             const accessServices = parseAccessServices(resource);
             const accessEndpoints = extractServiceEndpoints(accessServices);
             if (accessEndpoints.length > 0) {
@@ -243,7 +308,7 @@ export const formatPackageShowMarkdown = (result, serverUrl) => {
             }
             const effectiveDownloadUrl = resolveDownloadUrl(resource);
             if (effectiveDownloadUrl) {
-                markdown += `- **Effective Download URL**: ${effectiveDownloadUrl}\n`;
+                markdown += `- **Effective Download URL**: ${safeUrlText(effectiveDownloadUrl)}\n`;
             }
             if (resource.size) {
                 const formatBytes = (bytes) => {
@@ -565,7 +630,13 @@ Examples:
   - Filter extras OR (correct): { fq: "extras_hvd_category:(\"http://data.europa.eu/bna/c_ac64a52d\" OR \"http://data.europa.eu/bna/c_dd313021\")" }
   - Get facets: { facet_field: ["organization"], rows: 0 }
 
-Typical workflow: ckan_package_search → ckan_package_show (get full metadata + resource IDs) → ckan_datastore_search (query tabular data)`,
+Query language:
+  Before searching a portal, check its locale via ckan_status_show (field: "Portal Locale" / locale_default).
+  Translate query terms to the portal's language — searching in English on a non-English portal returns 0 results.
+  Examples: locale "it" → Italian terms; "uk_UA" → Ukrainian (Cyrillic); "fr_FR" → French.
+  Exception: multilingual portals (e.g. data.europa.eu, open.canada.ca) accept EN + native terms joined with OR.
+
+Typical workflow: ckan_status_show (check locale) → ckan_package_search (query in portal's language) → ckan_package_show (get full metadata + resource IDs) → ckan_datastore_search (query tabular data)`,
         inputSchema: z.object({
             server_url: z.string()
                 .url("Must be a valid URL")
@@ -796,10 +867,7 @@ ${hvdNote}`;
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error searching packages: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_package_search"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }
@@ -822,7 +890,13 @@ Args:
   - query (string): Natural language or keyword query (e.g., "mobilità urbana", "air quality")
   - limit (number): Number of datasets to return (default: 10)
   - weights (object): Field weights for scoring — higher weight = more influence on rank
-    Default: title=4, tags=3, notes=2, organization=1
+    Default: title=4, tags=3, notes=2, organization=1, holder=4, publisher=2
+    Note on holder vs organization: on federated catalogs (e.g. dati.gov.it), \`organization\`
+    is the harvesting catalog (e.g. Regione Puglia), while \`holder\` (DCAT-AP_IT dct:rightsHolder)
+    is the actual data owner (e.g. Comune di Lecce). Queries like "datasets from a specific Comune"
+    match \`holder\` correctly; matching only \`organization\` misses datasets harvested via
+    aggregators. \`publisher\` (dct:publisher) is scored separately at lower weight as it can
+    contain technical roles ("Redazione OD") rather than the institutional owner.
   - query_parser ('default' | 'text'): Override search parser behavior
   - response_format ('markdown' | 'json'): Output format
 
@@ -832,6 +906,7 @@ Returns:
 Examples:
   - { server_url: "https://dati.gov.it/opendata", query: "mobilità" }
   - { server_url: "...", query: "trasporti", limit: 5, weights: { title: 5, notes: 2 } }
+  - { server_url: "...", query: "defibrillatori Comune di Lecce", weights: { holder: 5 } }
 
 Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top results) → ckan_datastore_search (query data)`,
         inputSchema: z.object({
@@ -840,7 +915,7 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
                 .describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             query: z.string()
                 .min(2)
-                .describe("Natural language or keyword query to match against dataset title, notes, tags, and organization"),
+                .describe("Natural language or keyword query to match against dataset title, notes, tags, organization, holder and publisher"),
             limit: z.coerce.number()
                 .int()
                 .min(1)
@@ -852,7 +927,9 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
                 title: z.coerce.number().min(0).optional().describe("Weight for title match (default 4)"),
                 notes: z.coerce.number().min(0).optional().describe("Weight for description match (default 2)"),
                 tags: z.coerce.number().min(0).optional().describe("Weight for tag match (default 3)"),
-                organization: z.coerce.number().min(0).optional().describe("Weight for organization match (default 1)")
+                organization: z.coerce.number().min(0).optional().describe("Weight for organization (CKAN catalog / harvester) match (default 1)"),
+                holder: z.coerce.number().min(0).optional().describe("Weight for holder_name match — DCAT-AP_IT dct:rightsHolder, the actual data owner (default 4)"),
+                publisher: z.coerce.number().min(0).optional().describe("Weight for publisher_name match — DCAT-AP_IT dct:publisher (default 2)")
             }).optional().describe("Per-field scoring weights; unspecified fields use defaults"),
             query_parser: z.enum(["default", "text"])
                 .optional()
@@ -909,10 +986,7 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
                 results: top
             };
             if (params.response_format === ResponseFormat.JSON) {
-                return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(payload, null, 2)) }],
-                    structuredContent: payload
-                };
+                return jsonToolResult(payload);
             }
             let markdown = `# Relevant CKAN Datasets\n\n`;
             markdown += `**Server**: ${params.server_url}\n`;
@@ -924,7 +998,9 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
             markdown += `- **Title**: ${weights.title}\n`;
             markdown += `- **Notes**: ${weights.notes}\n`;
             markdown += `- **Tags**: ${weights.tags}\n`;
-            markdown += `- **Organization**: ${weights.organization}\n\n`;
+            markdown += `- **Organization**: ${weights.organization}\n`;
+            markdown += `- **Holder**: ${weights.holder}\n`;
+            markdown += `- **Publisher**: ${weights.publisher}\n\n`;
             if (top.length === 0) {
                 markdown += 'No datasets matched the query terms.\n';
                 markdown += `\n> **Note**: No data was found on this portal. Do not use information from other sources to supplement this result.\n`;
@@ -944,6 +1020,8 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
                     markdown += `- Notes: ${dataset.breakdown.notes}\n`;
                     markdown += `- Tags: ${dataset.breakdown.tags}\n`;
                     markdown += `- Organization: ${dataset.breakdown.organization}\n`;
+                    markdown += `- Holder: ${dataset.breakdown.holder}\n`;
+                    markdown += `- Publisher: ${dataset.breakdown.publisher}\n`;
                     markdown += `- Total: ${dataset.breakdown.total}\n\n`;
                 });
             }
@@ -953,10 +1031,7 @@ Typical workflow: ckan_find_relevant_datasets → ckan_package_show (inspect top
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error ranking datasets: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_find_relevant_datasets"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }
@@ -999,10 +1074,10 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
         inputSchema: z.object({
             server_url: z.string()
                 .url()
-                .describe("Base URL of the CKAN server"),
+                .describe("Base URL of the CKAN server (e.g., https://dati.gov.it/opendata)"),
             id: z.string()
                 .min(1)
-                .describe("Dataset ID or name"),
+                .describe("Dataset ID (UUID) or machine-readable name slug (e.g., 'raccolta-differenziata-comuni')"),
             include_tracking: z.boolean()
                 .optional()
                 .default(false)
@@ -1023,10 +1098,7 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
             });
             if (params.response_format === ResponseFormat.JSON) {
                 const compact = compactPackageShow(enrichPackageShowResult(result), params.server_url);
-                return {
-                    content: [{ type: "text", text: truncateJson(compact) }],
-                    structuredContent: compact
-                };
+                return jsonToolResult(compact);
             }
             const markdown = formatPackageShowMarkdown(result, params.server_url);
             return {
@@ -1035,14 +1107,20 @@ Typical workflow: ckan_package_show → pick a resource with datastore_active=tr
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error fetching package: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_package_show"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }
     });
+    async function checkSourceDatastore(portalUrl, resourceId) {
+        try {
+            await makeCkanRequest(portalUrl, 'datastore_search', { resource_id: resourceId, limit: 0 }, { cache: false });
+            return true;
+        }
+        catch {
+            return false;
+        }
+    }
     /**
      * List resources in a dataset with a compact summary
      */
@@ -1066,7 +1144,13 @@ Examples:
   - { server_url: "https://dati.gov.it/opendata", id: "dataset-name" }
   - { server_url: "...", id: "dataset-name", format_filter: "CSV" }
 
-Typical workflow: ckan_package_search → ckan_list_resources (assess available files) → ckan_datastore_search (for resources with DataStore=true)`,
+Typical workflow: ckan_package_search → ckan_list_resources (assess available files) → ckan_datastore_search (for resources with DataStore=true)
+
+When a resource has DataStore=false but its download URL belongs to a different (source) portal,
+the tool can probe the source portal for DataStore availability and report
+source_datastore_active and source_portal_url so you can query the data there instead.
+This probing is OFF by default (it issues extra HTTP requests to hosts taken from the
+dataset's own resource URLs); set check_source_portal=true to enable it.`,
         inputSchema: z.object({
             server_url: z.string()
                 .url()
@@ -1077,6 +1161,9 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
             format_filter: z.string()
                 .optional()
                 .describe("Filter resources by format, case-insensitive (e.g., 'CSV', 'json', 'XLSX')"),
+            check_source_portal: z.boolean()
+                .optional()
+                .describe("Opt-in (default false): when true, probes the source portal for DataStore availability when a resource URL points to a different CKAN instance. Issues extra HTTP requests to hosts taken from the dataset's resource URLs."),
             response_format: ResponseFormatSchema
         }).strict(),
         annotations: {
@@ -1090,6 +1177,7 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
             const result = await makeCkanRequest(params.server_url, 'package_show', { id: params.id });
             const resources = Array.isArray(result.resources) ? result.resources : [];
             const formatFilter = params.format_filter?.toUpperCase();
+            const doSourceCheck = params.check_source_portal === true;
             const summary = resources
                 .filter((r) => !formatFilter || (r.format || "").toUpperCase() === formatFilter)
                 .map((r) => {
@@ -1103,6 +1191,23 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
                     url: effectiveUrl
                 };
             });
+            if (doSourceCheck) {
+                // Cap the number of outbound probes so one call cannot fan out to an
+                // attacker-chosen number of requests (GHSA-3369 amplification).
+                const MAX_SOURCE_PROBES = 10;
+                const probes = summary
+                    .map((item, idx) => ({ item, idx }))
+                    .filter(({ item }) => !item.datastore_active && extractSourcePortal(item.url, params.server_url))
+                    .slice(0, MAX_SOURCE_PROBES);
+                await Promise.all(probes.map(async ({ item, idx }) => {
+                    const extracted = extractSourcePortal(item.url, params.server_url);
+                    if (!extracted)
+                        return;
+                    const active = await checkSourceDatastore(extracted.portalUrl, extracted.resourceId);
+                    summary[idx].source_datastore_active = active;
+                    summary[idx].source_portal_url = active ? extracted.portalUrl : null;
+                }));
+            }
             if (params.response_format === ResponseFormat.JSON) {
                 const payload = {
                     dataset_id: result.id,
@@ -1113,10 +1218,7 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
                     format_filter: formatFilter ?? null,
                     resources: summary
                 };
-                return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(payload, null, 2)) }],
-                    structuredContent: payload
-                };
+                return jsonToolResult(payload);
             }
             let markdown = `# Resources: ${result.title || result.name}\n\n`;
             markdown += `**Server**: ${params.server_url}\n`;
@@ -1133,17 +1235,27 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
             else {
                 markdown += `| Name | Format | Size | DataStore | ID |\n`;
                 markdown += `| --- | --- | --- | --- | --- |\n`;
+                // Neutralize portal-controlled names so they cannot break the table
+                // structure or inject markdown (GHSA-c499).
+                const cell = (s) => s.replace(/[\r\n]+/g, ' ').replace(/\|/g, '\\|');
                 for (const r of summary) {
-                    const name = r.name.length > 40 ? r.name.substring(0, 37) + '...' : r.name;
+                    const clipped = r.name.length > 40 ? r.name.substring(0, 37) + '...' : r.name;
                     const ds = r.datastore_active ? 'Yes' : 'No';
                     const size = r.size || '-';
-                    markdown += `| ${name} | ${r.format} | ${size} | ${ds} | \`${r.id}\` |\n`;
+                    markdown += `| ${cell(clipped)} | ${cell(r.format)} | ${size} | ${ds} | \`${r.id}\` |\n`;
                 }
                 const dsResources = summary.filter((r) => r.datastore_active);
                 if (dsResources.length > 0) {
                     markdown += `\n**DataStore-enabled resources** (queryable with \`ckan_datastore_search\`):\n`;
                     for (const r of dsResources) {
-                        markdown += `- **${r.name}** (${r.format}): \`${r.id}\`\n`;
+                        markdown += `- **${cell(r.name)}** (${cell(r.format)}): \`${r.id}\`\n`;
+                    }
+                }
+                const sourceResources = summary.filter((r) => r.source_datastore_active && r.source_portal_url);
+                if (sourceResources.length > 0) {
+                    markdown += `\n**Available on source portal** (use \`ckan_datastore_search\` with the source portal URL):\n`;
+                    for (const r of sourceResources) {
+                        markdown += `- **${cell(r.name)}** (${cell(r.format)}): \`${r.id}\` on ${safeUrlText(r.source_portal_url)}\n`;
                     }
                 }
             }
@@ -1153,10 +1265,7 @@ Typical workflow: ckan_package_search → ckan_list_resources (assess available 
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error listing resources: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_list_resources"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }

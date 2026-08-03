@@ -2,9 +2,10 @@
  * Generic SPARQL query tool for any public HTTPS SPARQL endpoint
  */
 import { z } from "zod";
-import { ResponseFormatSchema, ResponseFormat, CHARACTER_LIMIT } from "../types.js";
+import { ResponseFormatSchema, ResponseFormat } from "../types.js";
 import { getSparqlConfig } from "../utils/portal-config.js";
-import { validateServerUrl } from "../utils/http.js";
+import { validateServerUrl, assertHostnameResolvesSafe, safeFetch } from "../utils/http.js";
+import { truncateText, formatError, jsonToolResult } from "../utils/formatting.js";
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 1000;
 /**
@@ -31,6 +32,8 @@ export async function querySparqlEndpoint(endpointUrl, query) {
     if (url.protocol !== "https:") {
         throw new Error("Only HTTPS endpoints are allowed");
     }
+    // SSRF: block hostnames that resolve to private/internal addresses (DNS-name bypass)
+    await assertHostnameResolvesSafe(url.hostname);
     const sparqlConfig = getSparqlConfig(endpointUrl);
     const method = sparqlConfig?.method ?? "POST";
     const commonHeaders = {
@@ -44,28 +47,28 @@ export async function querySparqlEndpoint(endpointUrl, query) {
         if (method === "GET") {
             const getUrl = new URL(endpointUrl);
             getUrl.searchParams.set("query", query);
-            response = await fetch(getUrl.toString(), {
+            response = await safeFetch(getUrl.toString(), {
                 method: "GET",
                 signal: controller.signal,
                 headers: commonHeaders
-            });
+            }, { httpsOnly: true });
         }
         else {
-            response = await fetch(endpointUrl, {
+            response = await safeFetch(endpointUrl, {
                 method: "POST",
                 signal: controller.signal,
                 headers: { ...commonHeaders, "Content-Type": "application/sparql-query; charset=utf-8" },
                 body: query
-            });
+            }, { httpsOnly: true });
             // Fallback to GET if POST is rejected
             if (response.status === 403 || response.status === 405) {
                 const getUrl = new URL(endpointUrl);
                 getUrl.searchParams.set("query", query);
-                response = await fetch(getUrl.toString(), {
+                response = await safeFetch(getUrl.toString(), {
                     method: "GET",
                     signal: controller.signal,
                     headers: commonHeaders
-                });
+                }, { httpsOnly: true });
             }
         }
     }
@@ -158,26 +161,18 @@ Typical workflow: sparql_query (explore schema) → sparql_query (targeted query
             const data = await querySparqlEndpoint(params.endpoint_url, limitedQuery);
             if (params.response_format === ResponseFormat.JSON) {
                 const result = formatSparqlJson(data);
-                let text = JSON.stringify(result, null, 2);
-                if (text.length > CHARACTER_LIMIT) {
-                    text = text.slice(0, CHARACTER_LIMIT) + "\n/* output truncated */";
-                }
-                return {
-                    content: [{ type: "text", text }],
-                    structuredContent: result
-                };
+                return jsonToolResult(result);
             }
-            let text = formatSparqlMarkdown(data, params.endpoint_url);
-            if (text.length > CHARACTER_LIMIT) {
-                text = text.slice(0, CHARACTER_LIMIT) + "\n\n_Output truncated._";
-            }
-            return { content: [{ type: "text", text }] };
+            return {
+                content: [{ type: "text", text: truncateText(formatSparqlMarkdown(data, params.endpoint_url)) }]
+            };
         }
         catch (error) {
+            const message = `SPARQL query failed:\n${error instanceof Error ? error.message : String(error)}`;
             return {
                 content: [{
                         type: "text",
-                        text: `SPARQL query failed:\n${error instanceof Error ? error.message : String(error)}`
+                        text: formatError(message, params.response_format === ResponseFormat.JSON)
                     }],
                 isError: true
             };

@@ -3,8 +3,8 @@
  */
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
-import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, addDemoFooter } from "../utils/formatting.js";
+import { makeCkanRequest, formatCkanError } from "../utils/http.js";
+import { truncateText, truncateJson, addDemoFooter, formatError } from "../utils/formatting.js";
 export function formatAnalyzeDatasetsMarkdown(serverUrl, query, total, datasets) {
     let md = `# Dataset Analysis\n\n`;
     md += `**Server**: ${serverUrl}\n`;
@@ -126,7 +126,7 @@ Typical workflow: ckan_analyze_datasets → ckan_datastore_search (with known fi
             }));
             if (params.response_format === ResponseFormat.JSON) {
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify({ total: searchResult.count, datasets: analyzed }, null, 2)) }]
+                    content: [{ type: "text", text: truncateJson({ total: searchResult.count, datasets: analyzed }) }]
                 };
             }
             const markdown = formatAnalyzeDatasetsMarkdown(params.server_url, params.q, searchResult.count, analyzed);
@@ -136,10 +136,7 @@ Typical workflow: ckan_analyze_datasets → ckan_datastore_search (with known fi
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error analyzing datasets: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_analyze_datasets"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }
@@ -203,7 +200,7 @@ Typical workflow: ckan_catalog_stats (understand the portal) → ckan_package_se
             });
             if (params.response_format === ResponseFormat.JSON) {
                 return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify({ total: result.count, facets: result.facets }, null, 2)) }]
+                    content: [{ type: "text", text: truncateJson({ total: result.count, facets: result.facets }) }]
                 };
             }
             const markdown = formatCatalogStatsMarkdown(params.server_url, result.count, result.facets);
@@ -213,10 +210,7 @@ Typical workflow: ckan_catalog_stats (understand the portal) → ckan_package_se
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error retrieving catalog stats: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_catalog_stats"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }

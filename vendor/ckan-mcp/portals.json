@@ -7,7 +7,9 @@
             "api_url_aliases": [
                 "https://dati.gov.it/opendata",
                 "http://www.dati.gov.it/opendata",
-                "http://dati.gov.it/opendata"
+                "http://dati.gov.it/opendata",
+                "https://dati.gov.it",
+                "https://www.dati.gov.it"
             ],
             "search": {
                 "force_text_field": true
@@ -116,6 +118,38 @@
                 "https://ckan-prod.zurich.datopian.com"
             ],
             "organization_view_url": "https://ckan-prod.zurich.datopian.com/organization/{name}"
+        },
+        {
+            "id": "data-gov-ua",
+            "name": "data.gov.ua",
+            "api_url": "https://data.gov.ua",
+            "api_url_aliases": [
+                "http://data.gov.ua"
+            ],
+            "search": {
+                "force_text_field": false
+            }
+        },
+        {
+            "id": "dati-regione-sicilia",
+            "name": "dati.regione.sicilia.it",
+            "api_url": "https://dati.regione.sicilia.it",
+            "api_url_aliases": [
+                "http://dati.regione.sicilia.it"
+            ],
+            "search": {
+                "force_text_field": false
+            }
+        },
+        {
+            "id": "bdap-rgs-mef",
+            "name": "bdap-opendata.rgs.mef.gov.it",
+            "api_url": "https://bdap-opendata.rgs.mef.gov.it/SpodCkanApi",
+            "api_url_aliases": [
+                "http://bdap-opendata.rgs.mef.gov.it/SpodCkanApi"
+            ],
+            "dataset_view_url": "https://bdap-opendata.rgs.mef.gov.it/SpodCkanApi/dataset/{name}",
+            "organization_view_url": "https://bdap-opendata.rgs.mef.gov.it/SpodCkanApi/organization/{name}"
         },
         {
             "id": "govdata-de",

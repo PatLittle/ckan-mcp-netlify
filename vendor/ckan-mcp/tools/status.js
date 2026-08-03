@@ -3,18 +3,20 @@
  */
 import { z } from "zod";
 import { makeCkanRequest } from "../utils/http.js";
-import { addDemoFooter } from "../utils/formatting.js";
+import { truncateText, cappedStructured, addDemoFooter } from "../utils/formatting.js";
 import { getPortalSparqlConfig, getPortalHvdConfig } from "../utils/portal-config.js";
 export function formatStatusMarkdown(result, serverUrl, hvdCount) {
     const sparql = getPortalSparqlConfig(serverUrl);
     const sparqlLine = sparql ? `**SPARQL Endpoint**: ${sparql.endpoint_url}\n` : "";
     const hvdLine = hvdCount !== undefined ? `**HVD Datasets**: ${hvdCount}\n` : "";
+    const localeLine = result.locale_default ? `**Portal Locale**: ${result.locale_default}\n` : "";
     return `# CKAN Server Status\n\n` +
         `**Server**: ${serverUrl}\n` +
         `**Status**: ✅ Online\n` +
         `**CKAN Version**: ${result.ckan_version || 'Unknown'}\n` +
         `**Site Title**: ${result.site_title || 'N/A'}\n` +
         `**Site URL**: ${result.site_url || 'N/A'}\n` +
+        localeLine +
         sparqlLine +
         hvdLine;
 }
@@ -57,9 +59,12 @@ Typical workflow: ckan_status_show (verify server is up) → ckan_package_search
                     : Promise.resolve(undefined)
             ]);
             const markdown = formatStatusMarkdown(result, params.server_url, hvdCount);
+            // Text channel is Markdown, so there is no truncated JSON to derive the structured
+            // payload from — cap it on its own. status_show is echoed straight from the portal,
+            // so its field lengths are upstream-controlled and not bounded by anything (#39).
             return {
-                content: [{ type: "text", text: addDemoFooter(markdown) }],
-                structuredContent: result
+                content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }],
+                structuredContent: cappedStructured(result)
             };
         }
         catch (error) {

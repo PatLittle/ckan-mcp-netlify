@@ -3,8 +3,8 @@
  */
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
-import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, truncateJson, formatDate, addDemoFooter } from "../utils/formatting.js";
+import { makeCkanRequest, formatCkanError, CkanApiError } from "../utils/http.js";
+import { truncateText, formatDate, addDemoFooter, wrapUntrusted, formatError, jsonToolResult } from "../utils/formatting.js";
 import { getOrganizationViewUrl } from "../utils/url-generator.js";
 export function formatOrganizationShowMarkdown(result, serverUrl) {
     let markdown = `# Organization: ${result.title || result.name}\n\n`;
@@ -17,7 +17,7 @@ export function formatOrganizationShowMarkdown(result, serverUrl) {
     markdown += `- **Created**: ${formatDate(result.created)}\n`;
     markdown += `- **State**: ${result.state}\n\n`;
     if (result.description) {
-        markdown += `## Description\n\n${result.description}\n\n`;
+        markdown += `## Description\n\n${wrapUntrusted(result.description)}\n\n`;
     }
     if (result.packages && result.packages.length > 0) {
         const displayed = Math.min(result.packages.length, 20);
@@ -132,6 +132,7 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
                 });
                 const orgCount = searchResult.search_facets?.organization?.items?.length || 0;
                 if (params.response_format === ResponseFormat.JSON) {
+                    // A single count: no array to shrink, cannot approach the limit (#39).
                     return {
                         content: [{ type: "text", text: JSON.stringify({ count: orgCount }, null, 2) }],
                         structuredContent: { count: orgCount }
@@ -153,8 +154,7 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
                 });
             }
             catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                if (message.includes('CKAN API error (500)')) {
+                if (error instanceof CkanApiError && error.status === 500) {
                     const searchResult = await makeCkanRequest(params.server_url, 'package_search', {
                         rows: 0,
                         'facet.field': JSON.stringify(['organization']),
@@ -180,10 +180,7 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
                     }));
                     if (params.response_format === ResponseFormat.JSON) {
                         const output = { count: items.length, organizations };
-                        return {
-                            content: [{ type: "text", text: truncateJson(output) }],
-                            structuredContent: output
-                        };
+                        return jsonToolResult(output);
                     }
                     let markdown = `# CKAN Organizations\n\n`;
                     markdown += `**Server**: ${params.server_url}\n`;
@@ -203,10 +200,7 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
             }
             if (params.response_format === ResponseFormat.JSON) {
                 const compact = compactOrganizationList(result);
-                return {
-                    content: [{ type: "text", text: truncateJson(compact) }],
-                    structuredContent: compact
-                };
+                return jsonToolResult(compact);
             }
             let markdown = `# CKAN Organizations\n\n`;
             markdown += `**Server**: ${params.server_url}\n`;
@@ -218,7 +212,7 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
                         markdown += `- **ID**: \`${org.id}\`\n`;
                         markdown += `- **Name**: \`${org.name}\`\n`;
                         if (org.description)
-                            markdown += `- **Description**: ${org.description.substring(0, 200)}\n`;
+                            markdown += `- **Description**: ${org.description.substring(0, 200).replace(/[\r\n]+/g, ' ')}\n`;
                         markdown += `- **Datasets**: ${org.package_count || 0}\n`;
                         markdown += `- **Created**: ${formatDate(org.created)}\n`;
                         markdown += `- **Link**: ${getOrganizationViewUrl(params.server_url, org)}\n\n`;
@@ -234,10 +228,7 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error listing organizations: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_organization_list"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }
@@ -282,10 +273,7 @@ Typical workflow: ckan_organization_show → ckan_package_show (inspect a datase
             });
             if (params.response_format === ResponseFormat.JSON) {
                 const compact = compactOrganizationShow(result, params.server_url);
-                return {
-                    content: [{ type: "text", text: truncateJson(compact) }],
-                    structuredContent: compact
-                };
+                return jsonToolResult(compact);
             }
             const markdown = formatOrganizationShowMarkdown(result, params.server_url);
             return {
@@ -294,10 +282,7 @@ Typical workflow: ckan_organization_show → ckan_package_show (inspect a datase
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error fetching organization: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_organization_show"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }
@@ -361,10 +346,7 @@ Typical workflow: ckan_organization_search → ckan_organization_show (get detai
                         view_url: getOrganizationViewUrl(params.server_url, { name: item.name })
                     }))
                 };
-                return {
-                    content: [{ type: "text", text: truncateText(JSON.stringify(jsonResult, null, 2)) }],
-                    structuredContent: jsonResult
-                };
+                return jsonToolResult(jsonResult);
             }
             // Markdown format
             let markdown = `# CKAN Organization Search Results\n\n`;
@@ -391,10 +373,7 @@ Typical workflow: ckan_organization_search → ckan_organization_show (get detai
         }
         catch (error) {
             return {
-                content: [{
-                        type: "text",
-                        text: `Error searching organizations: ${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: formatError(formatCkanError(error, "ckan_organization_search"), params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }
