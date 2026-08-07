@@ -1,7 +1,7 @@
 import { getPortalSearchConfig } from "./portal-config.js";
 const DEFAULT_SEARCH_QUERY = "*:*";
 const FIELD_QUERY_PATTERN = /\b[a-zA-Z_][\w-]*:/;
-const SOLR_SPECIAL_CHARS = /[+\-!(){}[\]^"~*?:\\/|&]/g;
+const SOLR_SPECIAL_CHARS = /[+\-!(){}[\]^~*?:\\/|&]/g;
 function isFieldedQuery(query) {
     return FIELD_QUERY_PATTERN.test(query);
 }
@@ -69,7 +69,8 @@ export function resolveSearchQuery(serverUrl, query, parserOverride) {
     const portalForce = portalSearchConfig.force_text_field ?? false;
     let forceTextField = false;
     if (parserOverride === "text") {
-        forceTextField = true;
+        const trimmedQuery = query.trim();
+        forceTextField = trimmedQuery !== DEFAULT_SEARCH_QUERY && !isFieldedQuery(trimmedQuery);
     }
     else if (parserOverride === "default") {
         forceTextField = false;

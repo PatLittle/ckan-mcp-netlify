@@ -5,7 +5,7 @@
  */
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { truncateText } from "../utils/formatting.js";
+import { truncateJson } from "../utils/formatting.js";
 import { parseCkanUri } from "./uri.js";
 export function registerOrganizationResource(server) {
     server.registerResource("ckan-organization", new ResourceTemplate("ckan://{server}/organization/{name}", {
@@ -22,7 +22,7 @@ export function registerOrganizationResource(server) {
                 id: name,
                 include_datasets: false,
             });
-            const content = truncateText(JSON.stringify(result, null, 2));
+            const content = truncateJson(result);
             return {
                 contents: [
                     {

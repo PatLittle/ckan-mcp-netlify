@@ -4,18 +4,27 @@
 import { z } from "zod";
 import axios from "axios";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
-import { makeCkanRequest } from "../utils/http.js";
-import { addDemoFooter } from "../utils/formatting.js";
+import { makeCkanRequest, formatCkanError, safeFetch } from "../utils/http.js";
+import { truncateText, truncateJson, formatError, addDemoFooter } from "../utils/formatting.js";
 const MQA_API_BASE = "https://data.europa.eu/api/mqa/cache/datasets";
 const MQA_METRICS_BASE = "https://data.europa.eu/api/hub/repo/datasets";
-const ALLOWED_SERVER_PATTERNS = [
-    /^https?:\/\/(www\.)?dati\.gov\.it/i
-];
+const ALLOWED_MQA_HOSTS = new Set(["dati.gov.it", "www.dati.gov.it"]);
 /**
- * Validate server URL is dati.gov.it
+ * Validate server URL is dati.gov.it. Parses the URL and compares the exact host,
+ * so suffix (`dati.gov.it.attacker.com`) and userinfo (`dati.gov.it@attacker.com`)
+ * tricks that an unanchored regex would accept are rejected (GHSA-83x6).
  */
 export function isValidMqaServer(serverUrl) {
-    return ALLOWED_SERVER_PATTERNS.some(pattern => pattern.test(serverUrl));
+    let u;
+    try {
+        u = new URL(serverUrl);
+    }
+    catch {
+        return false;
+    }
+    if (u.protocol !== "https:" && u.protocol !== "http:")
+        return false;
+    return ALLOWED_MQA_HOSTS.has(u.hostname.toLowerCase());
 }
 function normalizeMqaIdentifier(identifier) {
     return identifier
@@ -331,11 +340,11 @@ async function fetchMqaQuality(serverUrl, datasetId) {
             });
             let metricsPayload;
             try {
-                const metricsResponse = await fetch(metricsUrl, {
+                const metricsResponse = await safeFetch(metricsUrl, {
                     headers: {
                         'User-Agent': 'CKAN-MCP-Server/1.0'
                     }
-                });
+                }, { httpsOnly: true });
                 if (!metricsResponse.ok) {
                     throw new Error(`MQA metrics error: ${metricsResponse.status} ${metricsResponse.statusText}`);
                 }
@@ -692,33 +701,33 @@ export function registerQualityTools(server) {
             return {
                 content: [{
                         type: "text",
-                        text: `Error: MQA quality metrics are only available for dati.gov.it datasets. ` +
+                        text: formatError(`Error: MQA quality metrics are only available for dati.gov.it datasets. ` +
                             `Provided server: ${server_url}\n\n` +
                             `The MQA (Metadata Quality Assurance) system is operated by data.europa.eu ` +
-                            `and only evaluates datasets from Italian open data portal.`
-                    }]
+                            `and only evaluates datasets from Italian open data portal.`, response_format === ResponseFormat.JSON)
+                    }],
+                isError: true
             };
         }
         try {
             const qualityData = await getMqaQuality(server_url, dataset_id);
+            // The demo footer is Markdown: appending it to JSON would break parsing (Workers only)
             const format = response_format || ResponseFormat.MARKDOWN;
             const output = format === ResponseFormat.JSON
-                ? JSON.stringify(qualityData, null, 2)
-                : formatQualityMarkdown(qualityData, dataset_id);
+                ? truncateJson(qualityData)
+                : truncateText(addDemoFooter(formatQualityMarkdown(qualityData, dataset_id)));
             return {
                 content: [{
                         type: "text",
-                        text: addDemoFooter(output)
+                        text: output
                     }]
             };
         }
         catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
+            const message = `Error retrieving quality metrics: ${formatCkanError(error, "ckan_get_mqa_quality")}`;
             return {
-                content: [{
-                        type: "text",
-                        text: `Error retrieving quality metrics: ${errorMessage}`
-                    }]
+                content: [{ type: "text", text: formatError(message, response_format === ResponseFormat.JSON) }],
+                isError: true
             };
         }
     });
@@ -744,33 +753,33 @@ export function registerQualityTools(server) {
             return {
                 content: [{
                         type: "text",
-                        text: `Error: MQA quality details are only available for dati.gov.it datasets. ` +
+                        text: formatError(`Error: MQA quality details are only available for dati.gov.it datasets. ` +
                             `Provided server: ${server_url}\n\n` +
                             `The MQA (Metadata Quality Assurance) system is operated by data.europa.eu ` +
-                            `and only evaluates datasets from Italian open data portal.`
-                    }]
+                            `and only evaluates datasets from Italian open data portal.`, response_format === ResponseFormat.JSON)
+                    }],
+                isError: true
             };
         }
         try {
             const details = await getMqaQualityDetails(server_url, dataset_id);
+            // The demo footer is Markdown: appending it to JSON would break parsing (Workers only)
             const format = response_format || ResponseFormat.MARKDOWN;
             const output = format === ResponseFormat.JSON
-                ? JSON.stringify(details, null, 2)
-                : formatQualityDetailsMarkdown(details, dataset_id);
+                ? truncateJson(details)
+                : truncateText(addDemoFooter(formatQualityDetailsMarkdown(details, dataset_id)));
             return {
                 content: [{
                         type: "text",
-                        text: addDemoFooter(output)
+                        text: output
                     }]
             };
         }
         catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
+            const message = `Error retrieving quality details: ${formatCkanError(error, "ckan_get_mqa_quality_details")}`;
             return {
-                content: [{
-                        type: "text",
-                        text: `Error retrieving quality details: ${errorMessage}`
-                    }]
+                content: [{ type: "text", text: formatError(message, response_format === ResponseFormat.JSON) }],
+                isError: true
             };
         }
     });

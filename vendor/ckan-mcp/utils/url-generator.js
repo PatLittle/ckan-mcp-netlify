@@ -1,5 +1,39 @@
 import portalsConfig from '../portals.json' with { type: "json" };
 import { getPortalConfig, normalizePortalUrl } from './portal-config.js';
+const UUID_RE = /\/resource\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+/**
+ * Given a resource download URL and the requesting server URL, returns the
+ * source portal origin and embedded resource ID when the resource belongs to
+ * a different CKAN portal (harvested dataset pattern). Returns null when the
+ * domain matches or the URL does not contain a CKAN resource path.
+ */
+export function extractSourcePortal(resourceUrl, serverUrl) {
+    if (!resourceUrl)
+        return null;
+    let rParsed;
+    let sParsed;
+    try {
+        rParsed = new URL(resourceUrl);
+        sParsed = new URL(serverUrl);
+    }
+    catch {
+        return null;
+    }
+    if (rParsed.hostname === sParsed.hostname)
+        return null;
+    // Reject non-default ports: probing an arbitrary host:port taken from dataset
+    // data would turn source-portal checks into a port-scan oracle (GHSA-3369).
+    // An empty `port` means the default 80/443 for the scheme.
+    if (rParsed.port !== "")
+        return null;
+    const match = rParsed.pathname.match(UUID_RE);
+    if (!match)
+        return null;
+    return {
+        portalUrl: `${rParsed.protocol}//${rParsed.hostname}`,
+        resourceId: match[1]
+    };
+}
 /**
  * Generate the view URL for a dataset
  */
