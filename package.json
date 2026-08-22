@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "refresh:vendor": "bash scripts/refresh-vendor.sh"
+    "refresh:vendor": "bash scripts/refresh-vendor.sh",
+    "refresh:my-info": "bash scripts/refresh-pibs-my-info.sh",
+    "test:my-info": "node --test tests/my-info-mcp.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^1.0.1",

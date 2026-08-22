@@ -1,0 +1,52 @@
+name: Refresh My Info MCP
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "PatLittle/pibs branch or tag"
+        required: false
+        default: "main"
+  schedule:
+    - cron: "40 4 * * 1"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  refresh-my-info:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Refresh My Info bundle
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref || 'main' }}
+        run: bash scripts/refresh-pibs-my-info.sh
+      - name: Read vendor metadata
+        id: meta
+        run: |
+          SHA=$(node --input-type=module -e "import fs from 'node:fs'; const m=JSON.parse(fs.readFileSync('vendor/pibs-my-info/.upstream.json','utf8')); console.log(m.commit)")
+          VERSION=$(node --input-type=module -e "import fs from 'node:fs'; const m=JSON.parse(fs.readFileSync('vendor/pibs-my-info/.upstream.json','utf8')); console.log(m.tool_api_version)")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha_short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: peter-evans/create-pull-request@v6
+        with:
+          branch: chore/refresh-pibs-my-info
+          delete-branch: true
+          title: "chore(vendor): refresh My Info MCP to ${{ steps.meta.outputs.sha_short }}"
+          commit-message: "chore(vendor): refresh My Info MCP to ${{ steps.meta.outputs.sha_short }}"
+          body: |
+            Automated My Info bundle refresh from `PatLittle/pibs`.
+
+            - Tool API version: `${{ steps.meta.outputs.version }}`
+            - Upstream commit: `${{ steps.meta.outputs.sha }}`
+          labels: |
+            dependencies
+            automation

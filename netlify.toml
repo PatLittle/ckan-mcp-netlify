@@ -5,11 +5,21 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "zisi"
+
+[functions.mcp]
   included_files = ["vendor/ckan-mcp/**"]
+
+[functions."my-info-mcp"]
+  included_files = ["vendor/pibs-my-info/**"]
 
 [[redirects]]
   from = "/mcp"
   to = "/.netlify/functions/mcp"
+  status = 200
+
+[[redirects]]
+  from = "/my-info/mcp"
+  to = "/.netlify/functions/my-info-mcp"
   status = 200
 
 [[redirects]]
