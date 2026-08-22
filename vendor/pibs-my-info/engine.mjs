@@ -3,7 +3,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(MODULE_DIR, "data");
+export function findDataDir(moduleDir = MODULE_DIR, cwd = process.cwd()) {
+  return [
+    path.join(moduleDir, "data"),
+    path.resolve(moduleDir, "../../vendor/pibs-my-info/data"),
+    path.resolve(cwd, "vendor/pibs-my-info/data")
+  ].find((candidate) => fs.existsSync(path.join(candidate, "runtime.json")));
+}
+
+const DATA_DIR = findDataDir();
+if (!DATA_DIR) {
+  throw new Error("My Info runtime data bundle was not found");
+}
 const runtime = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "runtime.json"), "utf8"));
 
 export const STATE_SCHEMA_VERSION = "1.1";
