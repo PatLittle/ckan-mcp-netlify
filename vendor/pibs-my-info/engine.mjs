@@ -19,6 +19,7 @@ const runtime = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "runtime.json"), 
 
 export const STATE_SCHEMA_VERSION = "1.1";
 export const TOOL_API_VERSION = "0.2.0";
+export const RELEASE_STAGE = "beta";
 export const ANSWER_VALUES = ["yes", "no", "not_sure", "prefer_not_to_answer"];
 export const TIMING_KINDS = [
   "current", "within_1_year", "1_to_3_years", "4_to_7_years",
@@ -62,6 +63,7 @@ export class SurveyToolEngine {
 
   getManifest() {
     return {
+      release_stage: RELEASE_STAGE,
       tool_api_version: TOOL_API_VERSION,
       state_schema_version: STATE_SCHEMA_VERSION,
       contract_schema_version: this.contract.schema_version,

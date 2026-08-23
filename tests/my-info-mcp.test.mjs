@@ -47,5 +47,8 @@ test("My Info Netlify adapter discovers and calls four tools", async () => {
     params: { name: "my_info_get_manifest", arguments: {} }
   });
   assert.equal(called.result.structuredContent.tool_api_version, "0.2.0");
+  assert.equal(called.result.structuredContent.release_stage, "beta");
+  assert.equal(called.result.structuredContent.contract_version, "2026-08-22.3");
   assert.equal(called.result.structuredContent.question_count, 21);
+  assert.equal(called.result.structuredContent.adaptive_route_count, 21);
 });

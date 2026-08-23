@@ -50,6 +50,7 @@ const output = (result) => ({
 });
 
 const manifestOutput = {
+  release_stage: z.string(),
   tool_api_version: z.string(),
   state_schema_version: z.string(),
   contract_schema_version: z.string(),
