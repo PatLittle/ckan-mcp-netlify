@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest } from "../utils/http.js";
-import { truncateText, addDemoFooter, formatError, jsonToolResult } from "../utils/formatting.js";
+import { truncateText, addDemoFooter, formatError, jsonToolResult, sanitizeInline } from "../utils/formatting.js";
 export function normalizeTagFacets(result) {
     const r = result;
     const searchFacets = r?.search_facets;
@@ -108,7 +108,7 @@ Typical workflow: ckan_tag_list → ckan_package_search with fq="tags:tag_name" 
             }
             else {
                 for (const tag of tags) {
-                    markdown += `- **${tag.name}**: ${tag.count}\n`;
+                    markdown += `- **${sanitizeInline(tag.name)}**: ${tag.count}\n`;
                 }
             }
             return {
