@@ -17,8 +17,8 @@ if (!DATA_DIR) {
 }
 const runtime = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "runtime.json"), "utf8"));
 
-export const STATE_SCHEMA_VERSION = "1.1";
-export const TOOL_API_VERSION = "0.2.0";
+export const STATE_SCHEMA_VERSION = "1.2";
+export const TOOL_API_VERSION = "0.4.0";
 export const RELEASE_STAGE = "beta";
 export const ANSWER_VALUES = ["yes", "no", "not_sure", "prefer_not_to_answer"];
 export const TIMING_KINDS = [
@@ -28,6 +28,14 @@ export const TIMING_KINDS = [
 
 const pipeSet = (value) => new Set(String(value || "").split("|").filter(Boolean));
 const boolValue = (value) => String(value).toLowerCase() === "true";
+const jsonList = (value) => {
+  try {
+    const parsed = JSON.parse(String(value || "[]"));
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
+};
 const clone = (value) => structuredClone(value);
 const onlyKeys = (value, allowed, label) => {
   for (const key of Object.keys(value)) {
@@ -47,7 +55,10 @@ export class SurveyToolEngine {
     this.routeOptions = Object.fromEntries(Object.entries(this.routes).map(([parent, route]) => [
       parent, Object.fromEntries(route.options.map((option) => [option.code, option]))
     ]));
-    this.categories = Object.fromEntries(contract.personal_information_categories.map((c) => [c.PI_CAT_ID, c]));
+    this.categories = Object.fromEntries(contract.personal_information_categories.map((c) => [c.category_id, c]));
+    this.featuresByQuestion = Object.fromEntries(this.questionOrder.map((code) => [
+      code, features.filter((row) => pipeSet(row.question_codes).has(code))
+    ]));
   }
 
   createState(locale = "en-CA") {
@@ -57,7 +68,8 @@ export class SurveyToolEngine {
       contract_version: this.contract.content_version,
       locale,
       answers: {},
-      refinements: {}
+      refinements: {},
+      departments: {}
     };
   }
 
@@ -88,11 +100,12 @@ export class SurveyToolEngine {
     };
   }
 
-  advance(state = null, answers = [], refinements = [], locale = "en-CA") {
+  advance(state = null, answers = [], refinements = [], departments = [], locale = "en-CA") {
     const working = state === null ? this.createState(locale) : clone(state);
     this.validateState(working);
     for (const update of answers || []) this.applyAnswer(working, update);
     for (const update of refinements || []) this.applyRefinement(working, update);
+    for (const update of departments || []) this.applyDepartment(working, update);
     this.validateState(working);
     let nextStep = null;
     for (const code of this.questionOrder) {
@@ -119,6 +132,11 @@ export class SurveyToolEngine {
         nextStep = this.timingView(code, working.locale, null);
         break;
       }
+      const departmentOptions = this.departmentOptions(code, working);
+      if (departmentOptions.length > 1 && !working.departments[code]) {
+        nextStep = this.departmentView(code, working.locale, departmentOptions);
+        break;
+      }
     }
     const timedYes = Object.entries(working.answers).filter(([code, answer]) =>
       answer.value === "yes" && (
@@ -140,14 +158,16 @@ export class SurveyToolEngine {
 
   validateState(state) {
     if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("state must be an object");
-    onlyKeys(state, new Set(["schema_version", "contract_version", "locale", "answers", "refinements"]), "state");
+    onlyKeys(state, new Set(["schema_version", "contract_version", "locale", "answers", "refinements", "departments"]), "state");
     if (state.schema_version !== STATE_SCHEMA_VERSION) throw new Error("Unsupported survey state schema_version");
     if (state.contract_version !== this.contract.content_version) throw new Error("Survey state contract_version does not match this data snapshot");
     this.validateLocale(state.locale);
     if (!state.answers || typeof state.answers !== "object" || Array.isArray(state.answers)) throw new Error("state.answers must be an object");
     if (!state.refinements || typeof state.refinements !== "object" || Array.isArray(state.refinements)) throw new Error("state.refinements must be an object");
+    if (!state.departments || typeof state.departments !== "object" || Array.isArray(state.departments)) throw new Error("state.departments must be an object");
     for (const [code, answer] of Object.entries(state.answers)) this.validateAnswer(code, answer);
     for (const [code, refinement] of Object.entries(state.refinements)) this.validateRefinement(code, refinement, state.answers);
+    for (const [code, selection] of Object.entries(state.departments)) this.validateDepartment(code, selection, state);
     return clone(state);
   }
 
@@ -212,7 +232,10 @@ export class SurveyToolEngine {
     if (update.timing !== undefined) answer.timing = clone(update.timing);
     this.validateAnswer(code, answer);
     state.answers[code] = answer;
-    if (answer.value !== "yes") delete state.refinements[code];
+    if (answer.value !== "yes") {
+      delete state.refinements[code];
+      delete state.departments[code];
+    }
   }
 
   applyRefinement(state, update) {
@@ -222,6 +245,40 @@ export class SurveyToolEngine {
     const refinement = { selected_options: clone(update.selected_options), timings: clone(update.timings || {}) };
     this.validateRefinement(code, refinement, state.answers);
     state.refinements[code] = refinement;
+    delete state.departments[code];
+  }
+
+  departmentOptions(code, state) {
+    let rows = this.featuresByQuestion[code] || [];
+    const refinement = state.refinements?.[code];
+    if (refinement && this.routes[code]) {
+      const options = refinement.selected_options.map((item) => this.routeOptions[code][item]);
+      if (!options.some((item) => item.fallback_to_parent)) {
+        const banks = new Set(options.flatMap((item) => item.selectors?.bank_numbers || []));
+        rows = rows.filter((row) => banks.has(row.bank_number_key));
+      }
+    }
+    const institutions = new Map();
+    for (const row of rows) if (row.institution_id) institutions.set(row.institution_id, { institution_id: row.institution_id, name_en: row.institution_name_en, name_fr: row.institution_name_fr });
+    return [...institutions.values()].sort((a, b) => a.name_en.localeCompare(b.name_en) || a.institution_id.localeCompare(b.institution_id));
+  }
+
+  validateDepartment(code, selection, state) {
+    if (state.answers?.[code]?.value !== "yes") throw new Error(`${code}: a department selection requires a yes parent answer`);
+    if (!Array.isArray(selection) || selection.length === 0) throw new Error(`${code}: department selection must be a non-empty array`);
+    if (new Set(selection).size !== selection.length) throw new Error(`${code}: department selection cannot contain duplicates`);
+    const allowed = new Set(this.departmentOptions(code, state).map((item) => item.institution_id));
+    const invalid = selection.filter((item) => !allowed.has(item));
+    if (invalid.length) throw new Error(`${code}: unsupported department IDs: ${invalid.join(", ")}`);
+  }
+
+  applyDepartment(state, update) {
+    if (!update || typeof update !== "object" || Array.isArray(update)) throw new Error("Each department update must be an object");
+    onlyKeys(update, new Set(["question_code", "institution_ids"]), "department update");
+    const code = String(update.question_code || "");
+    const selection = clone(update.institution_ids);
+    this.validateDepartment(code, selection, state);
+    state.departments[code] = selection;
   }
 
   questionView(code, locale) {
@@ -289,6 +346,18 @@ export class SurveyToolEngine {
     };
   }
 
+  departmentView(code, locale, options) {
+    const french = locale === "fr-CA";
+    return {
+      step_type: "department",
+      question_code: code,
+      prompt: french ? "À quelles institutions fédérales cette situation s'applique-t-elle?" : "Which federal departments or institutions did this apply to?",
+      selection_type: "multi_select",
+      options: options.map((item) => ({ institution_id: item.institution_id, label: item[french ? "name_fr" : "name_en"] })),
+      privacy_note: french ? "Choisissez seulement les institutions; ne fournissez aucun détail sur la plainte ou le dossier." : "Select institutions only; do not provide complaint or case details."
+    };
+  }
+
   evaluate(state, { asOfYear = null, includePossible = false, maxResults = 50, offset = 0 } = {}) {
     const normalized = this.validateState(state);
     const assessmentYear = asOfYear ?? new Date().getUTCFullYear();
@@ -302,6 +371,7 @@ export class SurveyToolEngine {
     const unanswered = this.questionOrder.filter((code) => !normalized.answers[code]);
     const uncertain = Object.entries(normalized.answers).filter(([, answer]) => ["not_sure", "prefer_not_to_answer"].includes(answer.value)).map(([code]) => code);
     const incomplete = Object.entries(normalized.answers).filter(([code, answer]) => answer.value === "yes" && this.routes[code] && !this.refinementComplete(code, normalized.refinements[code])).map(([code]) => code);
+    const incompleteDepartments = Object.entries(normalized.answers).filter(([code, answer]) => answer.value === "yes" && this.departmentOptions(code, normalized).length > 1 && !normalized.departments[code]).map(([code]) => code);
     const inventoryGaps = Object.entries(normalized.refinements).flatMap(([code, refinement]) => refinement.selected_options.filter((option) => this.routeOptions[code][option].coverage === "inventory_gap").map((option) => ({
       question_code: code,
       route_option_code: option,
@@ -313,10 +383,11 @@ export class SurveyToolEngine {
     return {
       assessment: {
         as_of_year: assessmentYear,
-        complete_survey: unanswered.length === 0 && incomplete.length === 0,
+        complete_survey: unanswered.length === 0 && incomplete.length === 0 && incompleteDepartments.length === 0,
         unanswered_question_codes: unanswered,
         uncertain_question_codes: uncertain,
         incomplete_refinement_question_codes: incomplete,
+        incomplete_department_question_codes: incompleteDepartments,
         inventory_gaps: inventoryGaps,
         refinement_needed_question_codes: refinementNeeded,
         caveat: "These are candidate PIBs, not confirmation that an institution holds information about this person."
@@ -359,11 +430,15 @@ export class SurveyToolEngine {
     for (const row of this.features) {
       const primary = pipeSet(row.question_codes);
       const candidates = pipeSet(row.candidate_question_codes);
-      const directRoutes = routeMatches.get(row.bank_number_key) || [];
+      const allows = (code) => {
+        const selected = state.departments[code];
+        return !selected || !row.institution_id || selected.includes(row.institution_id);
+      };
+      const directRoutes = (routeMatches.get(row.bank_number_key) || []).filter(([code]) => allows(code));
       const directCodes = new Set(directRoutes.map(([parent]) => parent));
-      const strong = [...new Set([...primary].filter((code) => broadYes.has(code)).concat([...directCodes]))].sort();
-      const possible = [...candidates].filter((code) => broadYes.has(code) && !strong.includes(code)).sort();
-      const review = [...candidates].filter((code) => uncertainCodes.has(code)).sort();
+      const strong = [...new Set([...primary].filter((code) => broadYes.has(code) && allows(code)).concat([...directCodes]))].sort();
+      const possible = [...candidates].filter((code) => broadYes.has(code) && allows(code) && !strong.includes(code)).sort();
+      const review = [...candidates].filter((code) => uncertainCodes.has(code) && allows(code)).sort();
       let band; let matched;
       if (strong.length) { band = "strong_match"; matched = strong; }
       else if (includePossible && possible.length) { band = "possible_match"; matched = possible; }
@@ -418,6 +493,7 @@ export class SurveyToolEngine {
         category_id: code,
         name: this.categories[code][french ? "name_fr" : "name_en"]
       })),
+      specific_information_types: jsonList(row[french ? "specific_information_types_fr" : "specific_information_types_en"]),
       privacy_caveat_codes: [...pipeSet(row.privacy_caveat_codes)].sort()
     };
   }
