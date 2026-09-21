@@ -11,9 +11,6 @@
                 "https://dati.gov.it",
                 "https://www.dati.gov.it"
             ],
-            "search": {
-                "force_text_field": true
-            },
             "hvd": {
                 "category_field": "hvd_category"
             },
@@ -30,10 +27,7 @@
             "api_url": "https://dati.arpae.it",
             "api_url_aliases": [
                 "http://dati.arpae.it"
-            ],
-            "search": {
-                "force_text_field": true
-            }
+            ]
         },
         {
             "id": "anac-opendata",
@@ -55,9 +49,6 @@
                 "http://www.data.gov.uk"
             ],
             "api_path": "/api/action",
-            "search": {
-                "force_text_field": true
-            },
             "dataset_view_url": "https://www.data.gov.uk/dataset/{id}/{name}",
             "organization_view_url": "https://www.data.gov.uk/organization/{name}"
         },
@@ -68,8 +59,9 @@
             "api_url_aliases": [
                 "http://catalog.data.gov"
             ],
-            "search": {
-                "force_text_field": true
+            "migrated": {
+                "notice": "catalog.data.gov stopped being a CKAN portal in 2025. Data.gov now serves its catalog through a different API (api.gsa.gov/technology/datagov/v4, key required, not CKAN-compatible), which this server does not speak.",
+                "docs_url": "https://resources.data.gov/catalog-api/"
             }
         },
         {
@@ -80,10 +72,7 @@
                 "http://open.canada.ca/data",
                 "https://open.canada.ca",
                 "http://open.canada.ca"
-            ],
-            "search": {
-                "force_text_field": true
-            }
+            ]
         },
         {
             "id": "data-gov-au",
@@ -125,10 +114,7 @@
             "api_url": "https://data.gov.ua",
             "api_url_aliases": [
                 "http://data.gov.ua"
-            ],
-            "search": {
-                "force_text_field": false
-            }
+            ]
         },
         {
             "id": "dati-regione-sicilia",
@@ -136,10 +122,7 @@
             "api_url": "https://dati.regione.sicilia.it",
             "api_url_aliases": [
                 "http://dati.regione.sicilia.it"
-            ],
-            "search": {
-                "force_text_field": false
-            }
+            ]
         },
         {
             "id": "bdap-rgs-mef",
@@ -168,9 +151,6 @@
     ],
     "defaults": {
         "dataset_view_url": "{server_url}/dataset/{name}",
-        "organization_view_url": "{server_url}/organization/{name}",
-        "search": {
-            "force_text_field": false
-        }
+        "organization_view_url": "{server_url}/organization/{name}"
     }
 }
