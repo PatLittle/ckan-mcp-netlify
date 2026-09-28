@@ -2,7 +2,6 @@
  * CKAN Quality (MQA) tools for dati.gov.it
  */
 import { z } from "zod";
-import axios from "axios";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest, formatCkanError, safeFetch } from "../utils/http.js";
 import { truncateText, truncateJson, formatError, addDemoFooter } from "../utils/formatting.js";
@@ -319,7 +318,234 @@ function findNonMaxDimensions(scores) {
     });
     return nonMax;
 }
-async function fetchMqaQuality(serverUrl, datasetId) {
+/*
+ * MQA methodology v2 (https://data.europa.eu/mqa/methodology): every metric is
+ * binary and weighted 1 / 0.5 / 0.25; dataset, distribution and data service each
+ * score 0-7.5, and the final dataset score averages the groups that are present.
+ */
+const V2_MAX_SCORE = 7.5;
+const V1_MAX_SCORE = 405;
+const V2_DIMENSIONS = ["findability", "accessibility", "interoperability", "reusability"];
+const V1_NOTE = "Not yet re-evaluated with MQA methodology v2: scores come from the previous MQA methodology (405-point scale, five dimensions).";
+const PROPERTY_PREFIXES = [
+    ["http://purl.org/dc/terms/", "dct:"],
+    ["http://www.w3.org/ns/dcat#", "dcat:"],
+    ["http://www.w3.org/ns/adms#", "adms:"],
+    ["http://xmlns.com/foaf/0.1/", "foaf:"],
+    ["http://data.europa.eu/r5r/", "dcatap:"]
+];
+function shortProperty(uri) {
+    for (const [namespace, prefix] of PROPERTY_PREFIXES) {
+        if (uri.startsWith(namespace)) {
+            return prefix + uri.slice(namespace.length);
+        }
+    }
+    return uri;
+}
+export function mqaBand(score) {
+    if (score >= 5)
+        return "Excellent";
+    if (score >= 2.5)
+        return "Good";
+    return "Sufficient";
+}
+function round(value, digits = 3) {
+    const factor = 10 ** digits;
+    return Math.round(value * factor) / factor;
+}
+function groupScore(entities) {
+    if (entities.length === 0) {
+        return null;
+    }
+    const average = entities.reduce((sum, entity) => sum + entity.score, 0) / entities.length;
+    return { count: entities.length, average: round(average) };
+}
+function parseMqaV2(entry, links) {
+    const dataset = entry.dataset;
+    if (!dataset || typeof dataset.score !== "number") {
+        throw new Error("Unexpected MQA payload: missing dataset score");
+    }
+    const groups = [
+        ["dataset", [dataset]],
+        ["distribution", Array.isArray(entry.distributions) ? entry.distributions : []],
+        ["dataService", Array.isArray(entry.dataServices) ? entry.dataServices : []]
+    ];
+    const groupsPresent = groups.filter(([, entities]) => entities.length > 0).length;
+    // A metadata-only dataset is scored on the dataset alone
+    const score = typeof entry.datasetFinal === "number" ? entry.datasetFinal : groupsPresent === 1 ? dataset.score : undefined;
+    if (score === undefined) {
+        throw new Error("Unexpected MQA payload: missing final dataset score");
+    }
+    const failing = [];
+    for (const [entity, entities] of groups) {
+        const byMetric = new Map();
+        for (const item of entities) {
+            for (const metric of item.metrics ?? []) {
+                if (metric.result === 1)
+                    continue;
+                const current = byMetric.get(metric.metric);
+                if (current) {
+                    current.failed += 1;
+                }
+                else {
+                    byMetric.set(metric.metric, { metric, failed: 1 });
+                }
+            }
+        }
+        for (const { metric, failed } of byMetric.values()) {
+            failing.push({
+                metric: metric.metric,
+                property: shortProperty(metric.property),
+                dimension: metric.dimension,
+                importance: metric.importance,
+                weight: metric.weight,
+                entity,
+                failed,
+                total: entities.length,
+                // The group average spans all its entities, and the final score averages the groups
+                gain: round(metric.weight * failed / entities.length / groupsPresent, 4)
+            });
+        }
+    }
+    failing.sort((a, b) => b.gain - a.gain || a.metric.localeCompare(b.metric));
+    return {
+        methodology: "v2",
+        metricsVersion: typeof entry.metricsVersion === "string" ? entry.metricsVersion : "2",
+        score: round(score, 4),
+        maxScore: V2_MAX_SCORE,
+        band: mqaBand(score),
+        dataset: { score: dataset.score, maxScore: V2_MAX_SCORE },
+        distributions: groupScore(groups[1][1]),
+        dataServices: groupScore(groups[2][1]),
+        failing,
+        ...links
+    };
+}
+const MQA_TIMEOUT_MS = 30000;
+// fetch, not axios: axios's fetch adapter breaks on Workers ("'cache' field ... not implemented")
+function fetchMqa(url) {
+    return safeFetch(url, {
+        headers: { 'User-Agent': 'CKAN-MCP-Server/1.0' },
+        signal: AbortSignal.timeout(MQA_TIMEOUT_MS)
+    }, { httpsOnly: true });
+}
+async function fetchMetricsGraph(metricsUrl) {
+    try {
+        const response = await fetchMqa(metricsUrl);
+        if (!response.ok) {
+            throw new Error(`${response.status} ${response.statusText}`);
+        }
+        try {
+            return await response.json();
+        }
+        catch {
+            return await response.text();
+        }
+    }
+    catch (error) {
+        throw new Error(`MQA metrics error: ${error instanceof Error ? error.message : String(error)}`);
+    }
+}
+async function fetchMqaV1(europeanId, links) {
+    const metricsUrl = `${MQA_METRICS_BASE}/${europeanId}/metrics`;
+    const notReEvaluated = `Dataset ${europeanId} is on data.europa.eu but not yet re-evaluated with MQA methodology v2, ` +
+        `and previous-methodology metrics are not available`;
+    let metrics;
+    try {
+        metrics = await fetchMetricsGraph(metricsUrl);
+    }
+    catch (error) {
+        throw new Error(`${notReEvaluated} (${error instanceof Error ? error.message : String(error)}).`);
+    }
+    const scores = extractMetricsScores(metrics);
+    // During the rollout the metrics endpoint may already hold v2 numbers: never print them on the 405 scale
+    const looksV1 = scores.contextuality !== undefined || (scores.total ?? 0) > V2_MAX_SCORE;
+    if (!looksV1) {
+        throw new Error(`${notReEvaluated}. Try again after the next harvest.`);
+    }
+    const nonMaxDimensions = findNonMaxDimensions(scores);
+    return {
+        methodology: "v1",
+        metricsVersion: "1",
+        note: V1_NOTE,
+        score: scores.total ?? null,
+        maxScore: V1_MAX_SCORE,
+        breakdown: {
+            scores,
+            nonMaxDimensions,
+            metricsUrl,
+            mqaUrl: links.mqaUrl,
+            portalId: europeanId
+        },
+        details: extractMetricDetails(metrics, nonMaxDimensions),
+        ...links
+    };
+}
+const STATUS_METRICS = new Set(["accessUrlStatusCode", "downloadUrlStatusCode"]);
+const HTTP_STATUS_CODE = "http://www.w3.org/2011/http#statusCodeValue";
+/**
+ * Count the non-2xx status codes of the URL tests in a metrics graph, per metric.
+ * v2 graphs carry the code in http:statusCodeValue, v1 graphs in dqv:value; codes from
+ * 1000 up are piveau's own (1100 = timeout). Only the latest code per distribution counts.
+ */
+function extractStatusCodes(metricsData) {
+    const latest = new Map();
+    const graph = decodeMetricsPayload(metricsData)?.["@graph"];
+    for (const node of Array.isArray(graph) ? graph : []) {
+        if (!node || typeof node !== "object")
+            continue;
+        const record = node;
+        const metricRef = record["dqv:isMeasurementOf"];
+        const metricId = typeof metricRef === "string" ? metricRef : metricRef?.["@id"];
+        if (typeof metricId !== "string")
+            continue;
+        const metric = metricKeyFromId(metricId);
+        if (!STATUS_METRICS.has(metric))
+            continue;
+        // Boolean result nodes share the metric id but carry no code: Number(false) must not read as 0
+        const raw = record[HTTP_STATUS_CODE] !== undefined ? Number(record[HTTP_STATUS_CODE]) : parseMetricValue(record["dqv:value"]);
+        if (typeof raw !== "number" || !Number.isInteger(raw))
+            continue;
+        const code = raw;
+        const target = record["dqv:computedOn"]?.["@id"];
+        const time = String(record["prov:generatedAtTime"]?.["@value"] ?? "");
+        const key = `${metric} ${typeof target === "string" ? target : ""}`;
+        const current = latest.get(key);
+        if (current && current.time > time)
+            continue;
+        const description = typeof record["dct:description"] === "string" ? record["dct:description"] : "";
+        const label = code >= 1000 ? `${code} ${/timeout/i.test(description) ? "timeout" : "connection error"}` : String(code);
+        latest.set(key, { metric, code, label, time });
+    }
+    const counts = new Map();
+    for (const { metric, code, label } of latest.values()) {
+        if (code >= 200 && code < 300)
+            continue;
+        const perMetric = counts.get(metric) ?? {};
+        perMetric[label] = (perMetric[label] ?? 0) + 1;
+        counts.set(metric, perMetric);
+    }
+    return counts;
+}
+/** Details only: the ~0.5 MB metrics graph says why URL tests failed; best effort, never fatal. */
+async function addHttpStatus(result) {
+    const urlTests = result.failing.filter(item => item.entity === "distribution" && STATUS_METRICS.has(item.metric));
+    if (urlTests.length === 0)
+        return;
+    let counts;
+    try {
+        counts = extractStatusCodes(await fetchMetricsGraph(`${MQA_METRICS_BASE}/${result.portalId}/metrics`));
+    }
+    catch {
+        return;
+    }
+    for (const item of urlTests) {
+        const perCode = counts.get(item.metric);
+        if (perCode)
+            item.httpStatus = perCode;
+    }
+}
+export async function getMqaQuality(serverUrl, datasetId, opts = {}) {
     const dataset = await makeCkanRequest(serverUrl, "package_show", { id: datasetId });
     // Step 2: Use identifier field, fallback to name
     const baseIdentifier = dataset.identifier || dataset.name;
@@ -327,351 +553,175 @@ async function fetchMqaQuality(serverUrl, datasetId) {
     if (candidates.length === 0) {
         throw new Error("Dataset identifier is empty; cannot query MQA API");
     }
-    // Step 3: Query MQA API (try candidates)
+    // Step 3: Query the MQA cache (try candidates)
     for (const europeanId of candidates) {
-        const mqaUrl = `${MQA_API_BASE}/${europeanId}`;
-        const metricsUrl = `${MQA_METRICS_BASE}/${europeanId}/metrics`;
+        const links = {
+            portalId: europeanId,
+            portalUrl: `https://data.europa.eu/data/datasets/${europeanId}/quality?locale=it`,
+            mqaUrl: `${MQA_API_BASE}/${europeanId}`
+        };
+        let response;
         try {
-            const response = await axios.get(mqaUrl, {
-                timeout: 30000,
-                headers: {
-                    'User-Agent': 'CKAN-MCP-Server/1.0'
-                }
-            });
-            let metricsPayload;
-            try {
-                const metricsResponse = await safeFetch(metricsUrl, {
-                    headers: {
-                        'User-Agent': 'CKAN-MCP-Server/1.0'
-                    }
-                }, { httpsOnly: true });
-                if (!metricsResponse.ok) {
-                    throw new Error(`MQA metrics error: ${metricsResponse.status} ${metricsResponse.statusText}`);
-                }
-                try {
-                    metricsPayload = await metricsResponse.json();
-                }
-                catch {
-                    metricsPayload = await metricsResponse.text();
-                }
-            }
-            catch (metricsError) {
-                if (metricsError instanceof Error) {
-                    throw new Error(`MQA metrics error: ${metricsError.message}`);
-                }
-                throw metricsError;
-            }
-            const scores = extractMetricsScores(metricsPayload);
-            const resultEntry = response.data?.result?.results?.[0];
-            const portalId = resultEntry?.info?.["dataset-id"] || europeanId;
-            const breakdown = {
-                scores,
-                nonMaxDimensions: findNonMaxDimensions(scores),
-                metricsUrl,
-                mqaUrl,
-                portalId
-            };
-            return {
-                mqa: response.data,
-                metrics: metricsPayload,
-                breakdown
-            };
+            response = await fetchMqa(links.mqaUrl);
         }
         catch (error) {
-            if (axios.isAxiosError(error)) {
-                if (error.response?.status === 404) {
-                    continue;
-                }
-                throw new Error(`MQA API error: ${error.message}`);
-            }
-            throw error;
+            throw new Error(`MQA API error: ${error instanceof Error ? error.message : String(error)}`);
         }
+        if (response.status === 404) {
+            // "No v2 metrics found": the dataset exists but has not been re-evaluated with v2 yet.
+            // Anything else ("DQV of dataset not found") means this candidate id is not on data.europa.eu.
+            if (/no v2 metrics/i.test(await response.text())) {
+                return fetchMqaV1(europeanId, links);
+            }
+            continue;
+        }
+        if (!response.ok) {
+            throw new Error(`MQA API error: ${response.status} ${response.statusText}`);
+        }
+        const payload = await response.json();
+        const entry = payload?.result?.results?.[0];
+        if (!entry || typeof entry !== "object") {
+            throw new Error("Unexpected MQA payload: no result");
+        }
+        const result = parseMqaV2(entry, links);
+        if (opts.httpStatus) {
+            await addHttpStatus(result);
+        }
+        return result;
     }
-    throw new Error(`Quality metrics not found or identifier not aligned on data.europa.eu. ` +
+    throw new Error(`No MQA record on data.europa.eu for this dataset (identifier may not be aligned). ` +
         `Tried: ${candidates.join(", ")}. ` +
         `Check the dataset quality page on data.europa.eu to confirm the identifier (it may include a '~~1' suffix) ` +
         `or verify alignment on dati.gov.it (quality may be marked as 'Non disponibile o identificativo non allineato').`);
 }
-export async function getMqaQuality(serverUrl, datasetId) {
-    const result = await fetchMqaQuality(serverUrl, datasetId);
-    return {
-        mqa: result.mqa,
-        breakdown: result.breakdown
-    };
+function formatNumber(value) {
+    return String(round(value, 2));
 }
-export async function getMqaQualityDetails(serverUrl, datasetId) {
-    const result = await fetchMqaQuality(serverUrl, datasetId);
-    const details = extractMetricDetails(result.metrics, result.breakdown.nonMaxDimensions);
-    return {
-        breakdown: result.breakdown,
-        details
-    };
+function describeFailing(item) {
+    const scope = item.entity === "dataset"
+        ? "dataset"
+        : `${item.failed} of ${item.total} ${item.entity === "distribution" ? "distributions" : "data services"}`;
+    let http = "";
+    if (item.httpStatus) {
+        const codes = Object.entries(item.httpStatus).sort((a, b) => b[1] - a[1]).map(([code, n]) => `${code} ×${n}`);
+        // e.g. distributions with no URL: the test did not run, so there is no code to show
+        const unexplained = item.failed - Object.values(item.httpStatus).reduce((sum, n) => sum + n, 0);
+        if (unexplained > 0)
+            codes.push(`no status recorded ×${unexplained}`);
+        http = `; HTTP test: ${codes.join(", ")}`;
+    }
+    return `\`${item.property}\` (${item.metric}, ${item.importance.toLowerCase()} ${item.weight}) - ${scope}, +${formatNumber(item.gain)}${http}`;
 }
-function findSectionMetric(section, key) {
-    if (!Array.isArray(section)) {
-        return undefined;
+function pushV2Scores(lines, result) {
+    lines.push(`**Score**: ${formatNumber(result.score)}/${result.maxScore} (${result.band})`);
+    lines.push(`Methodology: MQA v2 (metrics ${result.metricsVersion}). Bands: Sufficient < 2.5 ≤ Good < 5 ≤ Excellent.`);
+    lines.push("");
+    lines.push("## Scores");
+    lines.push(`- Dataset: ${formatNumber(result.dataset.score)}/${result.dataset.maxScore}`);
+    if (result.distributions) {
+        lines.push(`- Distributions (${result.distributions.count}): average ${formatNumber(result.distributions.average)}/${result.maxScore}`);
     }
-    for (const item of section) {
-        if (item && typeof item === "object" && key in item) {
-            return item[key];
-        }
+    if (result.dataServices) {
+        lines.push(`- Data services (${result.dataServices.count}): average ${formatNumber(result.dataServices.average)}/${result.maxScore}`);
     }
-    return undefined;
+    lines.push("");
 }
-function metricArrayIsAvailable(metric) {
-    if (!Array.isArray(metric)) {
-        return undefined;
+function pushV1Scores(lines, result) {
+    lines.push(`> ${result.note}`);
+    lines.push("");
+    const scores = result.breakdown.scores;
+    if (typeof scores.total === "number") {
+        lines.push(`**Score**: ${scores.total}/${result.maxScore}`);
+        lines.push("");
     }
-    const byName = new Map();
-    for (const entry of metric) {
-        if (!entry || typeof entry !== "object") {
+    lines.push("## Dimension Scores");
+    for (const dimension of Object.keys(DIMENSION_MAX)) {
+        const value = scores[dimension];
+        if (typeof value !== "number")
             continue;
-        }
-        const name = entry.name;
-        const percentage = entry.percentage;
-        if (typeof name === "string" && typeof percentage === "number") {
-            byName.set(name.toLowerCase(), percentage);
-        }
+        const max = DIMENSION_MAX[dimension];
+        const isMax = value >= max;
+        lines.push(`- ${DIMENSION_LABELS[dimension]}: ${value}/${max} ${isMax ? "✅" : "⚠️"}`);
     }
-    if (byName.has("yes")) {
-        return (byName.get("yes") || 0) > 0;
-    }
-    if (byName.size > 0) {
-        for (const [name, percentage] of byName.entries()) {
-            if (name.startsWith("2") && percentage > 0) {
-                return true;
-            }
-        }
-        return false;
-    }
-    return undefined;
-}
-function metricBoolean(section, key) {
-    const metric = findSectionMetric(section, key);
-    if (typeof metric === "boolean") {
-        return metric;
-    }
-    return undefined;
-}
-function metricAvailability(section, availabilityKey, statusKey) {
-    const availabilityMetric = findSectionMetric(section, availabilityKey);
-    const availability = metricArrayIsAvailable(availabilityMetric);
-    if (availability !== undefined) {
-        return { available: availability };
-    }
-    if (statusKey) {
-        const statusMetric = findSectionMetric(section, statusKey);
-        const statusAvailable = metricArrayIsAvailable(statusMetric);
-        if (statusAvailable !== undefined) {
-            return { available: statusAvailable };
-        }
-    }
-    return undefined;
-}
-function normalizeQualityData(data) {
-    const d = data;
-    const mqaData = (d?.mqa ?? data);
-    const breakdown = d?.breakdown;
-    const resultEntry = mqaData?.result?.results?.[0];
-    if (!resultEntry || typeof resultEntry !== "object") {
-        return { ...data, breakdown };
-    }
-    return {
-        id: resultEntry.info?.["dataset-id"],
-        info: { score: resultEntry.info?.score },
-        accessibility: {
-            accessUrl: metricAvailability(resultEntry.accessibility, "accessUrlAvailability", "accessUrlStatusCode"),
-            downloadUrl: metricAvailability(resultEntry.accessibility, "downloadUrlAvailability", "downloadUrlStatusCode")
-        },
-        reusability: {
-            licence: metricAvailability(resultEntry.reusability, "licenceAvailability"),
-            contactPoint: metricBoolean(resultEntry.reusability, "contactPointAvailability") !== undefined
-                ? { available: metricBoolean(resultEntry.reusability, "contactPointAvailability") }
-                : undefined,
-            publisher: metricBoolean(resultEntry.reusability, "publisherAvailability") !== undefined
-                ? { available: metricBoolean(resultEntry.reusability, "publisherAvailability") }
-                : undefined
-        },
-        interoperability: {
-            format: metricAvailability(resultEntry.interoperability, "formatAvailability"),
-            mediaType: metricAvailability(resultEntry.interoperability, "mediaTypeAvailability")
-        },
-        findability: {
-            keyword: metricBoolean(resultEntry.findability, "keywordAvailability") !== undefined
-                ? { available: metricBoolean(resultEntry.findability, "keywordAvailability") }
-                : undefined,
-            category: metricBoolean(resultEntry.findability, "categoryAvailability") !== undefined
-                ? { available: metricBoolean(resultEntry.findability, "categoryAvailability") }
-                : undefined,
-            spatial: metricBoolean(resultEntry.findability, "spatialAvailability") !== undefined
-                ? { available: metricBoolean(resultEntry.findability, "spatialAvailability") }
-                : undefined,
-            temporal: metricBoolean(resultEntry.findability, "temporalAvailability") !== undefined
-                ? { available: metricBoolean(resultEntry.findability, "temporalAvailability") }
-                : undefined
-        },
-        contextuality: {
-            byteSize: metricAvailability(resultEntry.contextuality, "byteSizeAvailability"),
-            rights: metricAvailability(resultEntry.contextuality, "rightsAvailability")
-        },
-        breakdown
-    };
-}
-export function formatQualityMarkdown(data, datasetId) {
-    const normalized = normalizeQualityData(data);
-    const lines = [];
-    lines.push(`# Quality Metrics for Dataset: ${datasetId}`);
     lines.push("");
-    if (normalized.info?.score !== undefined) {
-        lines.push(`**Overall Score**: ${normalized.info.score}/405`);
-        lines.push("");
-    }
-    if (normalized.breakdown?.scores) {
-        lines.push("## Dimension Scores");
-        const scores = normalized.breakdown.scores;
-        const order = [
-            ["accessibility", "Accessibility", DIMENSION_MAX.accessibility],
-            ["findability", "Findability", DIMENSION_MAX.findability],
-            ["interoperability", "Interoperability", DIMENSION_MAX.interoperability],
-            ["reusability", "Reusability", DIMENSION_MAX.reusability],
-            ["contextuality", "Contextuality", DIMENSION_MAX.contextuality]
-        ];
-        for (const [key, label, max] of order) {
-            const value = scores[key];
-            if (typeof value === "number") {
-                const isMax = value >= max;
-                const status = isMax ? "✅" : "⚠️";
-                lines.push(`- ${label}: ${value}/${max} ${status}${isMax ? "" : ` (max ${max})`}`);
-            }
-        }
-        if (normalized.breakdown.nonMaxDimensions.length > 0) {
-            lines.push(`- Non-max dimension(s): ${normalized.breakdown.nonMaxDimensions.join(", ")}`);
-        }
-        else if (Object.keys(scores).length > 0) {
-            lines.push("- Non-max dimension(s): none");
-        }
-        lines.push("");
-    }
-    // Accessibility
-    if (normalized.accessibility) {
-        lines.push("## Accessibility");
-        if (normalized.accessibility.accessUrl !== undefined) {
-            lines.push(`- Access URL: ${normalized.accessibility.accessUrl.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.accessibility.downloadUrl !== undefined) {
-            lines.push(`- Download URL: ${normalized.accessibility.downloadUrl.available ? '✓' : '✗'} Available`);
-        }
-        lines.push("");
-    }
-    // Reusability
-    if (normalized.reusability) {
-        lines.push("## Reusability");
-        if (normalized.reusability.licence !== undefined) {
-            lines.push(`- License: ${normalized.reusability.licence.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.reusability.contactPoint !== undefined) {
-            lines.push(`- Contact Point: ${normalized.reusability.contactPoint.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.reusability.publisher !== undefined) {
-            lines.push(`- Publisher: ${normalized.reusability.publisher.available ? '✓' : '✗'} Available`);
-        }
-        lines.push("");
-    }
-    // Interoperability
-    if (normalized.interoperability) {
-        lines.push("## Interoperability");
-        if (normalized.interoperability.format !== undefined) {
-            lines.push(`- Format: ${normalized.interoperability.format.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.interoperability.mediaType !== undefined) {
-            lines.push(`- Media Type: ${normalized.interoperability.mediaType.available ? '✓' : '✗'} Available`);
-        }
-        lines.push("");
-    }
-    // Findability
-    if (normalized.findability) {
-        lines.push("## Findability");
-        if (normalized.findability.keyword !== undefined) {
-            lines.push(`- Keywords: ${normalized.findability.keyword.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.findability.category !== undefined) {
-            lines.push(`- Category: ${normalized.findability.category.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.findability.spatial !== undefined) {
-            lines.push(`- Spatial: ${normalized.findability.spatial.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.findability.temporal !== undefined) {
-            lines.push(`- Temporal: ${normalized.findability.temporal.available ? '✓' : '✗'} Available`);
-        }
-        lines.push("");
-    }
-    if (normalized.contextuality) {
-        lines.push("## Contextuality");
-        if (normalized.contextuality.byteSize !== undefined) {
-            lines.push(`- Byte Size: ${normalized.contextuality.byteSize.available ? '✓' : '✗'} Available`);
-        }
-        if (normalized.contextuality.rights !== undefined) {
-            lines.push(`- Rights: ${normalized.contextuality.rights.available ? '✓' : '✗'} Available`);
-        }
-        lines.push("");
-    }
+}
+function pushLinks(lines, result) {
     lines.push("---");
-    const portalId = normalized.breakdown?.portalId || normalized.id || datasetId;
-    lines.push(`Portal: https://data.europa.eu/data/datasets/${portalId}/quality?locale=it`);
-    lines.push(`MQA source: ${MQA_API_BASE}/${portalId}`);
-    const metricsEndpoint = normalized.breakdown?.metricsUrl || `${MQA_METRICS_BASE}/${portalId}/metrics`;
-    lines.push(`Metrics endpoint: ${metricsEndpoint}`);
-    lines.push(`Tip: Use the metrics endpoint to explain score deductions (e.g., failing measurements such as knownLicence = false).`);
-    return lines.join("\n");
+    lines.push(`Portal: ${result.portalUrl}`);
+    lines.push(`MQA source: ${result.mqaUrl}`);
+    if (result.methodology === "v1") {
+        lines.push(`Metrics endpoint: ${result.breakdown.metricsUrl}`);
+    }
 }
-export function formatQualityDetailsMarkdown(data, datasetId) {
-    const lines = [];
-    const breakdown = data.breakdown;
-    lines.push(`# Quality Details for Dataset: ${datasetId}`);
-    lines.push("");
-    if (typeof breakdown.scores.total === "number") {
-        lines.push(`**Overall Score**: ${breakdown.scores.total}/405`);
-        lines.push("");
-    }
-    if (breakdown.scores) {
-        lines.push("## Dimension Scores");
-        const order = [
-            ["accessibility", DIMENSION_MAX.accessibility],
-            ["findability", DIMENSION_MAX.findability],
-            ["interoperability", DIMENSION_MAX.interoperability],
-            ["reusability", DIMENSION_MAX.reusability],
-            ["contextuality", DIMENSION_MAX.contextuality]
-        ];
-        for (const [key, max] of order) {
-            const value = breakdown.scores[key];
-            if (typeof value === "number") {
-                const status = value >= max ? "✅" : "⚠️";
-                lines.push(`- ${DIMENSION_LABELS[key]}: ${value}/${max} ${status}${value >= max ? "" : ` (max ${max})`}`);
-            }
+const TOP_FIXES = 5;
+/**
+ * Format MQA quality data as markdown (summary)
+ */
+export function formatQualityMarkdown(result, datasetId) {
+    const lines = [`# Quality Metrics for Dataset: ${datasetId}`, ""];
+    if (result.methodology === "v1") {
+        pushV1Scores(lines, result);
+        if (result.breakdown.nonMaxDimensions.length > 0) {
+            lines.push(`Non-max dimension(s): ${result.breakdown.nonMaxDimensions.join(", ")}. Use ckan_get_mqa_quality_details for the reasons.`);
+            lines.push("");
         }
-        lines.push("");
-    }
-    lines.push("## Non-max Reasons");
-    if (breakdown.nonMaxDimensions.length === 0) {
-        lines.push("- All dimensions are at max score.");
     }
     else {
-        for (const dimension of breakdown.nonMaxDimensions) {
-            const reasons = data.details.reasons[dimension] || [];
-            if (reasons.length === 0) {
-                lines.push(`- ${DIMENSION_LABELS[dimension]}: no failing flags detected in metrics payload`);
+        pushV2Scores(lines, result);
+        if (result.failing.length === 0) {
+            lines.push("All evaluated metrics are fulfilled.");
+        }
+        else {
+            lines.push(`## Top fixes (${Math.min(TOP_FIXES, result.failing.length)} of ${result.failing.length} failing metrics, by gain on the final score)`);
+            for (const item of result.failing.slice(0, TOP_FIXES)) {
+                lines.push(`- ${describeFailing(item)}`);
             }
-            else {
-                lines.push(`- ${DIMENSION_LABELS[dimension]}: ${reasons.join("; ")}`);
+            if (result.failing.length > TOP_FIXES) {
+                lines.push("- Use ckan_get_mqa_quality_details for the full list.");
             }
         }
+        lines.push("");
     }
-    lines.push("");
-    lines.push("---");
-    const portalId = breakdown.portalId || datasetId;
-    lines.push(`Portal: https://data.europa.eu/data/datasets/${portalId}/quality?locale=it`);
-    lines.push(`MQA source: ${MQA_API_BASE}/${portalId}`);
-    lines.push(`Metrics endpoint: ${breakdown.metricsUrl || `${MQA_METRICS_BASE}/${portalId}/metrics`}`);
+    pushLinks(lines, result);
+    return lines.join("\n");
+}
+/**
+ * Format MQA quality data as markdown (every failing metric)
+ */
+export function formatQualityDetailsMarkdown(result, datasetId) {
+    const lines = [`# Quality Details for Dataset: ${datasetId}`, ""];
+    if (result.methodology === "v1") {
+        pushV1Scores(lines, result);
+        lines.push("## Non-max Reasons");
+        if (result.breakdown.nonMaxDimensions.length === 0) {
+            lines.push("- All dimensions are at max score.");
+        }
+        for (const dimension of result.breakdown.nonMaxDimensions) {
+            const reasons = result.details.reasons[dimension] || [];
+            lines.push(`- ${DIMENSION_LABELS[dimension]}: ${reasons.length > 0 ? reasons.join("; ") : "no failing flags detected in metrics payload"}`);
+        }
+        lines.push("");
+    }
+    else {
+        pushV2Scores(lines, result);
+        if (result.failing.length === 0) {
+            lines.push("All evaluated metrics are fulfilled.");
+            lines.push("");
+        }
+        for (const dimension of V2_DIMENSIONS) {
+            const items = result.failing.filter(item => item.dimension === dimension);
+            if (items.length === 0)
+                continue;
+            lines.push(`## ${DIMENSION_LABELS[dimension]}`);
+            for (const item of items) {
+                lines.push(`- ${describeFailing(item)}`);
+            }
+            lines.push("");
+        }
+        lines.push("Gain = increase of the final score if every listed entity fulfilled the metric.");
+        lines.push("");
+    }
+    pushLinks(lines, result);
     return lines.join("\n");
 }
 /**
@@ -680,10 +730,12 @@ export function formatQualityDetailsMarkdown(data, datasetId) {
 export function registerQualityTools(server) {
     server.registerTool("ckan_get_mqa_quality", {
         title: "Get MQA Quality Score",
-        description: "Get MQA (Metadata Quality Assurance) quality metrics for a dataset on dati.gov.it. " +
-            "Returns quality score and detailed metrics (accessibility, reusability, interoperability, findability, contextuality) " +
-            "from data.europa.eu. Only works with dati.gov.it server. " +
-            "Typical workflow: ckan_package_show (get dataset ID) → ckan_get_mqa_quality → ckan_get_mqa_quality_details (for non-max dimensions)",
+        description: "Get MQA (Metadata Quality Assessment) quality score for a dataset on dati.gov.it from data.europa.eu. " +
+            "Returns the final score on the 0-7.5 scale of MQA methodology v2 with its band (Sufficient/Good/Excellent), " +
+            "dataset, distribution and data service scores, and the failing metrics with the largest gain. " +
+            "Datasets not yet re-evaluated fall back to the previous methodology (405 scale), labelled as such. " +
+            "Only works with dati.gov.it server. " +
+            "Typical workflow: ckan_package_show (get dataset ID) → ckan_get_mqa_quality → ckan_get_mqa_quality_details (full list of failing metrics)",
         inputSchema: z.object({
             server_url: z.string().url().describe("Base URL of dati.gov.it (e.g., https://www.dati.gov.it/opendata)"),
             dataset_id: z.string().describe("Dataset ID or name"),
@@ -733,8 +785,10 @@ export function registerQualityTools(server) {
     });
     server.registerTool("ckan_get_mqa_quality_details", {
         title: "Get MQA Quality Details",
-        description: "Get detailed MQA (Metadata Quality Assurance) quality reasons for a dataset on dati.gov.it. " +
-            "Returns dimension scores, non-max reasons, and raw MQA flags from data.europa.eu. " +
+        description: "Get detailed MQA (Metadata Quality Assessment) quality reasons for a dataset on dati.gov.it. " +
+            "Lists every failing metric grouped by FAIR dimension, with DCAT-AP property, weight, how many distributions fail it " +
+            "and its gain on the final score, plus the HTTP status of failing URL tests (e.g. 1100 timeout, 404) (methodology v2); " +
+            "previous-methodology datasets get non-max reasons. " +
             "Only works with dati.gov.it server. " +
             "Typical workflow: ckan_get_mqa_quality (get overview scores) → ckan_get_mqa_quality_details (inspect failing metrics)",
         inputSchema: z.object({
@@ -762,7 +816,7 @@ export function registerQualityTools(server) {
             };
         }
         try {
-            const details = await getMqaQualityDetails(server_url, dataset_id);
+            const details = await getMqaQuality(server_url, dataset_id, { httpStatus: true });
             // The demo footer is Markdown: appending it to JSON would break parsing (Workers only)
             const format = response_format || ResponseFormat.MARKDOWN;
             const output = format === ResponseFormat.JSON
