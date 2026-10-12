@@ -19,6 +19,18 @@ export function getPortalConfig(serverUrl) {
     });
     return portal || null;
 }
+/**
+ * Looked up by hostname, not by exact URL: a host that left CKAN has left it for
+ * every path, port and spelling, and the request router already resolves configured
+ * portals by hostname — `https://CATALOG.DATA.GOV:443/` must get the same answer.
+ */
+export function getPortalMigration(serverUrl) {
+    const hostname = extractHostname(serverUrl);
+    if (!hostname)
+        return null;
+    const portal = portalsConfig.portals.find((p) => [p.api_url, ...(p.api_url_aliases || [])].some((url) => extractHostname(url) === hostname));
+    return portal?.migrated ?? null;
+}
 export function getPortalSearchConfig(serverUrl) {
     const portal = getPortalConfig(serverUrl);
     const defaults = portalsConfig.defaults?.search || {};
