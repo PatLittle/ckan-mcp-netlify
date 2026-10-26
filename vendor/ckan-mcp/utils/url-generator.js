@@ -43,8 +43,8 @@ export function getDatasetViewUrl(serverUrl, pkg) {
     const template = portal?.dataset_view_url || portalsConfig.defaults.dataset_view_url;
     return template
         .replace('{server_url}', cleanServerUrl)
-        .replace('{id}', pkg.id)
-        .replace('{name}', pkg.name);
+        .replace('{id}', encodeURIComponent(pkg.id ?? ''))
+        .replace('{name}', encodeURIComponent(pkg.name ?? ''));
 }
 /**
  * Generate the view URL for an organization
@@ -55,6 +55,6 @@ export function getOrganizationViewUrl(serverUrl, org) {
     const template = portal?.organization_view_url || portalsConfig.defaults.organization_view_url;
     return template
         .replace('{server_url}', cleanServerUrl)
-        .replace('{id}', org.id)
-        .replace('{name}', org.name);
+        .replace('{id}', encodeURIComponent(org.id ?? ''))
+        .replace('{name}', encodeURIComponent(org.name ?? ''));
 }
