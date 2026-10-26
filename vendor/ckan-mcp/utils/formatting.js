@@ -38,15 +38,31 @@ export function truncateJson(obj, limit = CHARACTER_LIMIT) {
     const data = structuredClone(obj);
     for (const key of SHRINKABLE_KEYS) {
         if (Array.isArray(data[key]) && data[key].length > 0) {
-            const originalCount = data[key].length;
+            const original = data[key];
+            const originalCount = original.length;
             data['_truncated'] = true;
             data['_original_count'] = originalCount;
-            while (data[key].length > 0) {
-                data[key].pop();
-                json = JSON.stringify(data);
-                if (json.length <= limit)
-                    return json;
+            // Binary search for the largest fitting prefix: re-serializing after every
+            // single removal is quadratic, and lets a few MB from a hostile portal
+            // block the event loop for seconds (GHSA-w3gp-3hrh-v465).
+            let low = 0;
+            let high = originalCount - 1;
+            let best = null;
+            while (low <= high) {
+                const mid = Math.floor((low + high) / 2);
+                data[key] = original.slice(0, mid);
+                const candidate = JSON.stringify(data);
+                if (candidate.length <= limit) {
+                    best = candidate;
+                    low = mid + 1;
+                }
+                else {
+                    high = mid - 1;
+                }
             }
+            if (best !== null)
+                return best;
+            data[key] = [];
         }
     }
     // Last resort: a valid object saying so, instead of a string cut mid-value.
@@ -90,6 +106,26 @@ export function formatError(message, asJson) {
     return asJson
         ? JSON.stringify({ error: message, _error: true }, null, 2)
         : message;
+}
+/**
+ * Render a short portal-provided string (title, name, field id, label) inside a markdown
+ * line — heading, bullet or table cell.
+ *
+ * Two characters carry structure and must not survive: a newline ends the construct and
+ * lets the portal open a line of its own, which reads to an agent exactly like one this
+ * server wrote; a pipe adds a cell and shifts every later value under the wrong header.
+ *
+ * For free text (notes, description) use `wrapUntrusted` instead — a fence says "this is
+ * data" in a way escaping cannot.
+ */
+export function sanitizeInline(text) {
+    return String(text ?? '')
+        .replace(/[\r\n]+/g, ' ')
+        .replace(/\|/g, '\\|')
+        // A backtick escapes an inline code span, so a value rendered as `${...}` could
+        // close it and emit live markdown on the same line. Same substitution
+        // `wrapUntrusted` uses for fences (U+02BC, not a backtick).
+        .replace(/`/g, 'ʼ');
 }
 /**
  * Wrap portal-provided free text (notes/description) — which is attacker-influenced —
