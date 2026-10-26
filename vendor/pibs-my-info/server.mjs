@@ -18,11 +18,12 @@ const SurveyRefinement = z.object({
 }).strict();
 
 const SurveyState = z.object({
-  schema_version: z.literal("1.1"),
+  schema_version: z.literal("1.2"),
   contract_version: z.string(),
   locale: z.enum(["en-CA", "fr-CA"]),
   answers: z.record(SurveyAnswer),
-  refinements: z.record(SurveyRefinement)
+  refinements: z.record(SurveyRefinement),
+  departments: z.record(z.array(z.string()).min(1))
 }).strict();
 
 const AnswerUpdate = z.object({
@@ -35,6 +36,11 @@ const RefinementUpdate = z.object({
   question_code: z.string(),
   selected_options: z.array(z.string()).min(1),
   timings: z.record(Timing).default({})
+}).strict();
+
+const DepartmentUpdate = z.object({
+  question_code: z.string(),
+  institution_ids: z.array(z.string()).min(1)
 }).strict();
 
 const readOnly = {
@@ -101,7 +107,7 @@ export function createServer() {
   return new McpServer({
     name: "my-info-canada",
     title: "My Info Canada",
-    version: "0.2.0"
+    version: "0.4.0"
   }, {
     instructions: "Call my_info_get_manifest first. Keep survey state client-side, use only controlled answers and adaptive selections, never send identifying or narrative case details, and never claim that a candidate PIB proves a record exists."
   });
@@ -118,17 +124,18 @@ export function registerAll(server) {
 
   server.registerTool("my_info_advance", {
     title: "Advance the My Info survey",
-    description: "Start or continue the survey using controlled answers, adaptive selections and client-owned state.",
+    description: "Start or continue the survey using controlled answers, adaptive selections, department selections and client-owned state.",
     inputSchema: {
       state: SurveyState.nullable().optional(),
       answers: z.array(AnswerUpdate).nullable().optional(),
       refinements: z.array(RefinementUpdate).nullable().optional(),
+      departments: z.array(DepartmentUpdate).nullable().optional(),
       locale: z.enum(["en-CA", "fr-CA"]).default("en-CA")
     },
     outputSchema: advanceOutput,
     annotations: readOnly
-  }, async ({ state = null, answers = [], refinements = [], locale = "en-CA" }) =>
-    output(engine.advance(state, answers || [], refinements || [], locale))
+  }, async ({ state = null, answers = [], refinements = [], departments = [], locale = "en-CA" }) =>
+    output(engine.advance(state, answers || [], refinements || [], departments || [], locale))
   );
 
   server.registerTool("my_info_evaluate", {
