@@ -4,18 +4,19 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest, formatCkanError, CkanApiError } from "../utils/http.js";
-import { truncateText, formatDate, addDemoFooter, wrapUntrusted, formatError, jsonToolResult } from "../utils/formatting.js";
+import { truncateText, formatDate, addDemoFooter, wrapUntrusted, formatError, jsonToolResult, sanitizeInline } from "../utils/formatting.js";
 import { getOrganizationViewUrl } from "../utils/url-generator.js";
+import { stripAccents } from "../utils/search.js";
 export function formatOrganizationShowMarkdown(result, serverUrl) {
-    let markdown = `# Organization: ${result.title || result.name}\n\n`;
+    let markdown = `# Organization: ${sanitizeInline(result.title || result.name)}\n\n`;
     markdown += `**Server**: ${serverUrl}\n`;
     markdown += `**Link**: ${getOrganizationViewUrl(serverUrl, result)}\n\n`;
     markdown += `## Details\n\n`;
-    markdown += `- **ID**: \`${result.id}\`\n`;
-    markdown += `- **Name**: \`${result.name}\`\n`;
+    markdown += `- **ID**: \`${sanitizeInline(result.id)}\`\n`;
+    markdown += `- **Name**: \`${sanitizeInline(result.name)}\`\n`;
     markdown += `- **Datasets**: ${result.package_count || 0}\n`;
     markdown += `- **Created**: ${formatDate(result.created)}\n`;
-    markdown += `- **State**: ${result.state}\n\n`;
+    markdown += `- **State**: ${sanitizeInline(result.state)}\n\n`;
     if (result.description) {
         markdown += `## Description\n\n${wrapUntrusted(result.description)}\n\n`;
     }
@@ -26,7 +27,7 @@ export function formatOrganizationShowMarkdown(result, serverUrl) {
             : '';
         markdown += `## Datasets (showing ${displayed} of ${result.packages.length} returned${totalHint})\n\n`;
         for (const pkg of result.packages.slice(0, 20)) {
-            markdown += `- **${pkg.title || pkg.name}** (\`${pkg.name}\`)\n`;
+            markdown += `- **${sanitizeInline(pkg.title || pkg.name)}** (\`${sanitizeInline(pkg.name)}\`)\n`;
         }
         if (result.packages.length > 20) {
             markdown += `\n... and ${result.packages.length - 20} more datasets\n`;
@@ -36,7 +37,7 @@ export function formatOrganizationShowMarkdown(result, serverUrl) {
     if (result.users && result.users.length > 0) {
         markdown += `## Users (${result.users.length})\n\n`;
         for (const user of result.users) {
-            markdown += `- **${user.name}** (${user.capacity})\n`;
+            markdown += `- **${sanitizeInline(user.name)}** (${sanitizeInline(user.capacity)})\n`;
         }
         markdown += '\n';
     }
@@ -187,8 +188,8 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
                     markdown += `**Total**: ${items.length}\n`;
                     markdown += `\nNote: organization_list returned 500; using package_search facets.\n\n`;
                     for (const org of organizations) {
-                        markdown += `## ${org.title || org.name}\n\n`;
-                        markdown += `- **Name**: \`${org.name}\`\n`;
+                        markdown += `## ${sanitizeInline(org.title || org.name)}\n\n`;
+                        markdown += `- **Name**: \`${sanitizeInline(org.name)}\`\n`;
                         markdown += `- **Datasets**: ${org.package_count || 0}\n`;
                         markdown += `- **Link**: ${getOrganizationViewUrl(params.server_url, org)}\n\n`;
                     }
@@ -208,11 +209,11 @@ Typical workflow: ckan_organization_list → ckan_organization_show (inspect one
             if (Array.isArray(result)) {
                 if (params.all_fields) {
                     for (const org of result) {
-                        markdown += `## ${org.title || org.name}\n\n`;
-                        markdown += `- **ID**: \`${org.id}\`\n`;
-                        markdown += `- **Name**: \`${org.name}\`\n`;
+                        markdown += `## ${sanitizeInline(org.title || org.name)}\n\n`;
+                        markdown += `- **ID**: \`${sanitizeInline(org.id)}\`\n`;
+                        markdown += `- **Name**: \`${sanitizeInline(org.name)}\`\n`;
                         if (org.description)
-                            markdown += `- **Description**: ${org.description.substring(0, 200).replace(/[\r\n]+/g, ' ')}\n`;
+                            markdown += `- **Description**: ${sanitizeInline(org.description.substring(0, 200))}\n`;
                         markdown += `- **Datasets**: ${org.package_count || 0}\n`;
                         markdown += `- **Created**: ${formatDate(org.created)}\n`;
                         markdown += `- **Link**: ${getOrganizationViewUrl(params.server_url, org)}\n\n`;
@@ -307,7 +308,7 @@ Returns:
 
 Examples:
   - { server_url: "https://www.dati.gov.it/opendata", pattern: "toscana" }
-  - { server_url: "https://catalog.data.gov", pattern: "health" }
+  - { server_url: "https://open.canada.ca/data", pattern: "health" }
 
 Typical workflow: ckan_organization_search → ckan_organization_show (get details) → ckan_package_search with fq="organization:name"`,
         inputSchema: z.object({
@@ -323,8 +324,11 @@ Typical workflow: ckan_organization_search → ckan_organization_show (get detai
         }
     }, async (params) => {
         try {
-            // Build Solr query with wildcards (lowercase: Solr org names are always lowercase)
-            const query = `organization:*${params.pattern.toLowerCase()}*`;
+            // Build Solr query with wildcards. A wildcard term bypasses Solr's analysis
+            // chain, so the pattern has to be pre-normalised the way CKAN builds the name
+            // slug: lowercase and without accents. Otherwise `città` finds nothing while
+            // `citta` finds 135 organizations, `citta-metropolitana-di-*` among them.
+            const query = `organization:*${stripAccents(params.pattern.toLowerCase())}*`;
             // Search using package_search with faceting
             const result = await makeCkanRequest(params.server_url, 'package_search', {
                 q: query,
@@ -364,7 +368,7 @@ Typical workflow: ckan_organization_search → ckan_organization_show (get detai
                 markdown += `|--------------|----------|------|\n`;
                 for (const org of orgFacets) {
                     const viewUrl = getOrganizationViewUrl(params.server_url, { name: org.name });
-                    markdown += `| ${org.display_name || org.name} | ${org.count} | ${viewUrl} |\n`;
+                    markdown += `| ${sanitizeInline(org.display_name || org.name)} | ${org.count} | ${viewUrl} |\n`;
                 }
             }
             return {
