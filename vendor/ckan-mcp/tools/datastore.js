@@ -3,34 +3,60 @@
  */
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
-import { makeCkanRequest, formatCkanError } from "../utils/http.js";
-import { truncateText, truncateJson, addDemoFooter, formatError, jsonToolResult } from "../utils/formatting.js";
+import { makeCkanRequest, formatCkanError, CkanApiError } from "../utils/http.js";
+import { truncateText, truncateJson, addDemoFooter, formatError, jsonToolResult, sanitizeInline } from "../utils/formatting.js";
+const MAX_TABLE_COLUMNS = 8;
+/**
+ * CKAN internal columns. `_full_text` is only returned by `datastore_search_sql`
+ * on `SELECT *`: it repeats the whole row as one concatenated string, so it
+ * carries no new information and must not take up a table slot.
+ */
+const INTERNAL_FIELDS = ['_id', '_full_text'];
+const isInternalField = (id) => INTERNAL_FIELDS.includes(id);
+const MAX_LISTED_OMITTED_COLUMNS = 15;
+/**
+ * Warn when the record table shows only a subset of the columns, so the model
+ * does not read a truncated table as the full set of available columns.
+ */
+function formatOmittedColumnsNote(allFields, hint) {
+    if (allFields.length <= MAX_TABLE_COLUMNS)
+        return '';
+    const omitted = allFields.slice(MAX_TABLE_COLUMNS);
+    const listed = omitted.slice(0, MAX_LISTED_OMITTED_COLUMNS).map(sanitizeInline).join(', ');
+    const rest = omitted.length > MAX_LISTED_OMITTED_COLUMNS
+        ? ` and ${omitted.length - MAX_LISTED_OMITTED_COLUMNS} more`
+        : '';
+    return `\n> **Note**: the table above shows only the first ${MAX_TABLE_COLUMNS} of ${allFields.length} columns. Columns not shown: ${listed}${rest}. They do hold values — ${hint}\n`;
+}
 export function formatDatastoreSearchMarkdown(result, serverUrl, resourceId, offset, limit) {
     let markdown = `# DataStore Query Results\n\n`;
     markdown += `**Server**: ${serverUrl}\n`;
     markdown += `**Resource ID**: \`${resourceId}\`\n`;
     markdown += `**Total Records**: ${result.total || 0}\n`;
     markdown += `**Returned**: ${result.records ? result.records.length : 0} records\n\n`;
-    if (result.fields && result.fields.length > 0) {
+    const declaredFields = (result.fields || []).filter((f) => f.id !== '_full_text');
+    if (declaredFields.length > 0) {
         markdown += `## Fields\n\n`;
-        markdown += result.fields.map((f) => `- **${f.id}** (${f.type})`).join('\n') + '\n\n';
+        markdown += declaredFields.map((f) => `- **${sanitizeInline(f.id)}** (${sanitizeInline(f.type)})`).join('\n') + '\n\n';
     }
     if (result.records && result.records.length > 0) {
         markdown += `## Records\n\n`;
-        const fields = result.fields ? result.fields.map((f) => f.id).filter(id => id !== '_id') : [];
-        const displayFields = fields.slice(0, 8);
-        markdown += `| ${displayFields.join(' | ')} |\n`;
+        const fields = result.fields ? result.fields.map((f) => f.id).filter(id => !isInternalField(id)) : [];
+        const displayFields = fields.slice(0, MAX_TABLE_COLUMNS);
+        markdown += `| ${displayFields.map(sanitizeInline).join(' | ')} |\n`;
         markdown += `| ${displayFields.map(() => '---').join(' | ')} |\n`;
         for (const record of result.records.slice(0, 50)) {
             const values = displayFields.map(field => {
                 const val = record[field];
                 if (val === null || val === undefined)
                     return '-';
-                const str = String(val);
-                return str.length > 80 ? str.substring(0, 77) + '...' : str;
+                // Clip first, escape second: escaping after the cut can slice a `\|` in half.
+                const raw = String(val);
+                return sanitizeInline(raw.length > 80 ? raw.substring(0, 77) + '...' : raw);
             });
             markdown += `| ${values.join(' | ')} |\n`;
         }
+        markdown += formatOmittedColumnsNote(fields, 'use the `fields` parameter to select them, or `response_format: "json"` to get every column.');
         if (result.records.length > 50) {
             markdown += `\n... and ${result.records.length - 50} more records\n`;
         }
@@ -48,30 +74,33 @@ export function formatDatastoreSearchMarkdown(result, serverUrl, resourceId, off
 }
 export function formatDatastoreSqlMarkdown(result, serverUrl, sql) {
     const records = result.records || [];
-    const fieldIds = (result.fields?.map((field) => field.id) || Object.keys(records[0] || {})).filter(id => id !== '_id');
+    const fieldIds = (result.fields?.map((field) => field.id) || Object.keys(records[0] || {})).filter(id => !isInternalField(id));
     let markdown = `# DataStore SQL Results\n\n`;
     markdown += `**Server**: ${serverUrl}\n`;
     markdown += `**SQL**: \`${sql}\`\n`;
     markdown += `**Returned**: ${records.length} records\n\n`;
-    if (result.fields && result.fields.length > 0) {
+    const declaredFields = (result.fields || []).filter((field) => field.id !== '_full_text');
+    if (declaredFields.length > 0) {
         markdown += `## Fields\n\n`;
-        markdown += result.fields.map((field) => `- **${field.id}** (${field.type})`).join('\n') + '\n\n';
+        markdown += declaredFields.map((field) => `- **${sanitizeInline(field.id)}** (${sanitizeInline(field.type)})`).join('\n') + '\n\n';
     }
     if (records.length > 0 && fieldIds.length > 0) {
         markdown += `## Records\n\n`;
-        const displayFields = fieldIds.slice(0, 8);
-        markdown += `| ${displayFields.join(' | ')} |\n`;
+        const displayFields = fieldIds.slice(0, MAX_TABLE_COLUMNS);
+        markdown += `| ${displayFields.map(sanitizeInline).join(' | ')} |\n`;
         markdown += `| ${displayFields.map(() => '---').join(' | ')} |\n`;
         for (const record of records.slice(0, 50)) {
             const values = displayFields.map((field) => {
                 const value = record[field];
                 if (value === null || value === undefined)
                     return '-';
-                const text = String(value);
-                return text.length > 80 ? text.substring(0, 77) + '...' : text;
+                // Clip first, escape second: escaping after the cut can slice a `\|` in half.
+                const raw = String(value);
+                return sanitizeInline(raw.length > 80 ? raw.substring(0, 77) + '...' : raw);
             });
             markdown += `| ${values.join(' | ')} |\n`;
         }
+        markdown += formatOmittedColumnsNote(fieldIds, 'name them explicitly in the SELECT clause, or use `response_format: "json"` to get every column.');
         if (records.length > 50) {
             markdown += `\n... and ${records.length - 50} more records\n`;
         }
@@ -84,20 +113,36 @@ export function formatDatastoreSqlMarkdown(result, serverUrl, sql) {
     return markdown;
 }
 /**
- * Compact datastore result: filter _id from fields and records.
+ * Compact datastore result: filter CKAN internal columns from fields and records.
  */
 export function compactDatastoreResult(result) {
-    const fields = (result.fields || []).filter((f) => f.id !== '_id');
-    const records = (result.records || []).map((record) => {
-        const { _id, ...rest } = record;
-        return rest;
-    });
+    const fields = (result.fields || []).filter((f) => !isInternalField(f.id));
+    const records = (result.records || []).map((record) => Object.fromEntries(Object.entries(record).filter(([key]) => !isInternalField(key))));
     return {
         resource_id: result.resource_id || null,
         fields,
         records,
         total: result.total ?? 0
     };
+}
+/**
+ * Some portals lose the `sql` parameter on GET: donnees.montreal.ca answers 409
+ * `sql: Valeur manquante` to any query and runs the same one sent by POST. SQL errors come
+ * under `query:`, so a reason under `sql:` is about the parameter, not the query.
+ * A query too long for a URL gets 414 on GET and runs the same way.
+ */
+async function runDatastoreSql(serverUrl, sql) {
+    try {
+        return await makeCkanRequest(serverUrl, "datastore_search_sql", { sql });
+    }
+    catch (error) {
+        const lostOnGet = error instanceof CkanApiError &&
+            (error.status === 414 || (error.status === 409 && error.ckanReason?.startsWith("sql:")));
+        if (lostOnGet) {
+            return await makeCkanRequest(serverUrl, "datastore_search_sql", { sql }, { post: true });
+        }
+        throw error;
+    }
 }
 export function registerDatastoreTools(server) {
     /**
@@ -225,12 +270,14 @@ Security note: SQL queries are forwarded directly to the CKAN DataStore API. The
         }
     }, async (params) => {
         try {
-            const result = await makeCkanRequest(params.server_url, 'datastore_search_sql', { sql: params.sql });
+            // CKAN wraps the query in a subquery, where a final `;` is a syntax error.
+            const sql = params.sql.replace(/[;\s]+$/, "");
+            const result = await runDatastoreSql(params.server_url, sql);
             if (params.response_format === ResponseFormat.JSON) {
                 const compact = compactDatastoreResult(result);
                 return jsonToolResult(compact);
             }
-            const markdown = formatDatastoreSqlMarkdown(result, params.server_url, params.sql);
+            const markdown = formatDatastoreSqlMarkdown(result, params.server_url, sql);
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }]
             };
