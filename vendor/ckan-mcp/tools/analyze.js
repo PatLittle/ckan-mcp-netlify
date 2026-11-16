@@ -4,7 +4,7 @@
 import { z } from "zod";
 import { ResponseFormat, ResponseFormatSchema } from "../types.js";
 import { makeCkanRequest, formatCkanError } from "../utils/http.js";
-import { truncateText, truncateJson, addDemoFooter, formatError } from "../utils/formatting.js";
+import { truncateText, truncateJson, addDemoFooter, formatError, sanitizeInline } from "../utils/formatting.js";
 export function formatAnalyzeDatasetsMarkdown(serverUrl, query, total, datasets) {
     let md = `# Dataset Analysis\n\n`;
     md += `**Server**: ${serverUrl}\n`;
@@ -13,19 +13,19 @@ export function formatAnalyzeDatasetsMarkdown(serverUrl, query, total, datasets)
     md += `**Datasets analyzed**: ${datasets.length}\n\n`;
     for (const { dataset, datastoreResources, nonDatastoreResources } of datasets) {
         md += `---\n\n`;
-        md += `## ${dataset.title || dataset.name}\n\n`;
-        md += `- **ID**: \`${dataset.id}\`\n`;
-        md += `- **Name**: \`${dataset.name}\`\n`;
+        md += `## ${sanitizeInline(dataset.title || dataset.name)}\n\n`;
+        md += `- **ID**: \`${sanitizeInline(dataset.id)}\`\n`;
+        md += `- **Name**: \`${sanitizeInline(dataset.name)}\`\n`;
         if (dataset.organization) {
-            md += `- **Organization**: ${dataset.organization.title || dataset.organization.name}\n`;
+            md += `- **Organization**: ${sanitizeInline(dataset.organization.title || dataset.organization.name)}\n`;
         }
         if (datastoreResources.length > 0) {
             md += `\n### DataStore Resources\n\n`;
             for (const { resource, schema, error } of datastoreResources) {
-                md += `#### ${resource.name || resource.id}\n\n`;
-                md += `- **Resource ID**: \`${resource.id}\`\n`;
+                md += `#### ${sanitizeInline(resource.name || resource.id)}\n\n`;
+                md += `- **Resource ID**: \`${sanitizeInline(resource.id)}\`\n`;
                 if (resource.format)
-                    md += `- **Format**: ${resource.format}\n`;
+                    md += `- **Format**: ${sanitizeInline(resource.format)}\n`;
                 if (error) {
                     md += `- **Error**: ${error}\n`;
                 }
@@ -35,11 +35,11 @@ export function formatAnalyzeDatasetsMarkdown(serverUrl, query, total, datasets)
                     if (fields.length > 0) {
                         md += `\n**Fields** (${fields.length}):\n\n`;
                         for (const f of fields) {
-                            let line = `- \`${f.id}\` (${f.type})`;
+                            let line = `- \`${sanitizeInline(f.id)}\` (${sanitizeInline(f.type)})`;
                             if (f.info?.label)
-                                line += ` — ${f.info.label}`;
+                                line += ` — ${sanitizeInline(f.info.label)}`;
                             if (f.info?.notes)
-                                line += `: ${f.info.notes}`;
+                                line += `: ${sanitizeInline(f.info.notes)}`;
                             md += line + '\n';
                         }
                     }
@@ -50,7 +50,7 @@ export function formatAnalyzeDatasetsMarkdown(serverUrl, query, total, datasets)
         if (nonDatastoreResources.length > 0) {
             md += `### Other Resources (not queryable)\n\n`;
             for (const r of nonDatastoreResources) {
-                md += `- ${r.name || '(unnamed)'}${r.format ? ` (${r.format})` : ''}\n`;
+                md += `- ${sanitizeInline(r.name || '(unnamed)')}${r.format ? ` (${sanitizeInline(r.format)})` : ''}\n`;
             }
             md += '\n';
         }
@@ -158,7 +158,7 @@ export function formatCatalogStatsMarkdown(serverUrl, total, facets) {
         const sorted = Object.entries(values).sort((a, b) => b[1] - a[1]);
         md += `\n## ${label}\n\n`;
         for (const [name, count] of sorted) {
-            md += `- **${name}**: ${count}\n`;
+            md += `- **${sanitizeInline(name)}**: ${count}\n`;
         }
     }
     return md;

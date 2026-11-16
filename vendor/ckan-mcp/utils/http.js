@@ -2,295 +2,89 @@
  * HTTP utilities for CKAN API requests
  */
 import axios from "axios";
-import { getPortalApiUrlForHostname, getPortalApiPath } from "./portal-config.js";
+import { getPortalApiUrlForHostname, getPortalApiPath, getPortalMigration } from "./portal-config.js";
 import { buildCacheKey, getCache, getCacheConfig, getTtlForAction } from "./cache.js";
 import { getRateLimiter, getRateLimitConfig } from "./rate-limiter.js";
-export class CkanApiError extends Error {
-    status;
-    action;
-    constructor(message, status, action) {
-        super(message);
-        this.name = 'CkanApiError';
-        this.status = status;
-        this.action = action;
-    }
-}
-export function formatCkanError(error, _toolName) {
-    if (!(error instanceof CkanApiError)) {
-        return error instanceof Error ? error.message : String(error);
-    }
-    const { status, action, message } = error;
-    let hint = '';
-    if (status === 404) {
-        if (action.startsWith('datastore_search')) {
-            hint = '→ Get a valid resource_id first: call `ckan_package_show` on a dataset, then pick a resource where `datastore_active` is true.';
-        }
-        else if (action === 'package_show') {
-            hint = '→ Use `ckan_package_search` to find a valid dataset name or ID.';
-        }
-        else if (action === 'organization_show') {
-            hint = '→ Use `ckan_organization_list` or `ckan_organization_search` to discover valid organization names.';
-        }
-    }
-    else if (status === 400) {
-        if (action === 'datastore_search_sql') {
-            hint = '→ Invalid SQL syntax or unknown column — check column names with `ckan_datastore_search` before writing SQL.';
-        }
-        else if (action.startsWith('datastore_search')) {
-            hint = '→ Bad request — likely an invalid field name or filter syntax; check column names with a `SELECT *` query first.';
-        }
-    }
-    else if (status === 409 || status === 422) {
-        hint = '→ Portal rejected the request — parameters may conflict; simplify filters and retry.';
-    }
-    else if (status === 503 || status === 502 || status === 504) {
-        hint = '→ Portal temporarily unavailable — retry in a few seconds.';
-    }
-    else if (status === 500) {
-        hint = '→ Portal internal error — try a different portal or retry later.';
-    }
-    else if (status === undefined) {
-        hint = '→ The portal may not support this action, or the endpoint is unavailable.';
-    }
-    return hint ? `${message}\n${hint}` : message;
-}
-let _lastCacheHit = null;
-/** Returns whether the last makeCkanRequest call was served from cache. */
-export function getLastCacheHit() {
-    return _lastCacheHit;
-}
+import { SsrfGuardError, readBoundedText, decodePossiblyCompressed, createSafeAgents, isPrivateHostAllowed as isPrivateHostAllowedIn, validateServerUrl as validateServerUrlWith, assertRedirectKeepsPrivateExemption as assertRedirectKeepsPrivateExemptionWith, createSsrfSafeLookup as createSsrfSafeLookupWith, safeFetch as safeFetchWith } from "./safe-http.js";
+export { SsrfGuardError, isBlockedIp, getSafeDispatcher, __setDnsResolverForTests, assertHostnameResolvesSafe } from "./safe-http.js";
+// The CKAN_* settings of the HTTP safety layer. They are read here and passed to
+// safe-http.ts on every call, which reads no configuration itself. Each is read when
+// it was before: the size caps once at load, the others on every call, at every
+// redirect hop of safeFetch and at every DNS lookup of the safe agents.
 // Response/decompression size caps (DoS prevention — GHSA-q5gv). Generous enough for
 // any legitimate CKAN JSON, small enough to stop a decompression bomb from OOM-ing us.
 const MAX_RESPONSE_BYTES = (typeof process !== "undefined" && Number(process.env?.CKAN_MAX_RESPONSE_BYTES)) || 32 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES = (typeof process !== "undefined" && Number(process.env?.CKAN_MAX_DECOMPRESSED_BYTES)) || 64 * 1024 * 1024;
-const loadZlib = (() => {
-    let cached = null;
-    return async () => {
-        if (!cached) {
-            cached = (async () => {
-                try {
-                    const mod = (await import("node:" + "zlib"));
-                    return mod;
-                }
-                catch {
-                    return null;
-                }
-            })();
-        }
-        return cached;
+/** `CKAN_PRIVATE_HOSTS`, read on every call; empty when unset or off Node. */
+function ckanPrivateHosts() {
+    return typeof process !== 'undefined' ? (process.env.CKAN_PRIVATE_HOSTS ?? '') : '';
+}
+/** `CKAN_ALLOWED_DOMAINS` and `CKAN_PRIVATE_HOSTS`, read on every call. */
+function ckanUrlGuardSettings() {
+    return {
+        allowedDomains: typeof process !== 'undefined' ? (process.env.CKAN_ALLOWED_DOMAINS ?? '') : '',
+        privateHosts: ckanPrivateHosts(),
+        allowedDomainsName: 'CKAN_ALLOWED_DOMAINS',
+        privateHostsName: 'CKAN_PRIVATE_HOSTS'
     };
-})();
-function getHeaderValue(headers, name) {
-    if (!headers) {
-        return undefined;
-    }
-    const target = name.toLowerCase();
-    for (const [key, value] of Object.entries(headers)) {
-        if (key.toLowerCase() === target) {
-            return Array.isArray(value) ? value.join(",") : String(value);
-        }
-    }
-    return undefined;
-}
-function asBuffer(data) {
-    if (!data) {
-        return undefined;
-    }
-    if (typeof Buffer === "undefined") {
-        return undefined;
-    }
-    if (Buffer.isBuffer(data)) {
-        return data;
-    }
-    if (data instanceof ArrayBuffer) {
-        return Buffer.from(data);
-    }
-    if (ArrayBuffer.isView(data)) {
-        return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
-    }
-    return undefined;
-}
-function asArrayBuffer(data) {
-    if (!data) {
-        return undefined;
-    }
-    if (data instanceof ArrayBuffer) {
-        return data;
-    }
-    if (ArrayBuffer.isView(data)) {
-        return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
-    }
-    return undefined;
-}
-async function decodeArrayBufferText(buffer, encoding) {
-    if (encoding && typeof DecompressionStream !== "undefined") {
-        try {
-            const stream = new DecompressionStream(encoding.includes("br")
-                ? "br"
-                : encoding.includes("deflate")
-                    ? "deflate"
-                    : "gzip");
-            const decompressed = await new Response(new Blob([buffer]).stream().pipeThrough(stream)).arrayBuffer();
-            if (decompressed.byteLength > MAX_DECOMPRESSED_BYTES) {
-                throw new Error("Decompressed response exceeds size limit");
-            }
-            return new TextDecoder("utf-8").decode(decompressed).trim();
-        }
-        catch {
-            // Fall back to plain text decoding.
-        }
-    }
-    return new TextDecoder("utf-8").decode(buffer).trim();
-}
-async function decodePossiblyCompressed(data, headers) {
-    if (data === null || data === undefined) {
-        return data;
-    }
-    const arrayBuffer = asArrayBuffer(data);
-    if (arrayBuffer && typeof Buffer === "undefined") {
-        const encoding = getHeaderValue(headers, "content-encoding");
-        const text = await decodeArrayBufferText(arrayBuffer, encoding);
-        if (!text) {
-            return text;
-        }
-        try {
-            return JSON.parse(text);
-        }
-        catch {
-            return text;
-        }
-    }
-    if (typeof data === "string") {
-        try {
-            return JSON.parse(data);
-        }
-        catch {
-            return data;
-        }
-    }
-    const buffer = asBuffer(data);
-    if (!buffer) {
-        if (typeof data === "object") {
-            return data;
-        }
-        return data;
-    }
-    const encoding = getHeaderValue(headers, "content-encoding");
-    let decodedBuffer = buffer;
-    const zlib = await loadZlib();
-    const zlibOpts = { maxOutputLength: MAX_DECOMPRESSED_BYTES };
-    try {
-        if (zlib) {
-            if (encoding?.includes("gzip")) {
-                decodedBuffer = zlib.gunzipSync(buffer, zlibOpts);
-            }
-            else if (encoding?.includes("br")) {
-                decodedBuffer = zlib.brotliDecompressSync(buffer, zlibOpts);
-            }
-            else if (encoding?.includes("deflate")) {
-                decodedBuffer = zlib.inflateSync(buffer, zlibOpts);
-            }
-            else if (buffer.length >= 2 &&
-                buffer[0] === 0x1f &&
-                buffer[1] === 0x8b) {
-                decodedBuffer = zlib.gunzipSync(buffer, zlibOpts);
-            }
-        }
-    }
-    catch {
-        // Decompression failed or exceeded maxOutputLength: fall back to the raw buffer
-        // (kept bounded below by MAX_RESPONSE_BYTES on the request paths).
-        decodedBuffer = buffer;
-    }
-    const text = decodedBuffer.toString("utf-8").trim();
-    if (!text) {
-        return text;
-    }
-    try {
-        return JSON.parse(text);
-    }
-    catch {
-        return text;
-    }
 }
 /**
- * Returns true if an IP address (IPv4 or IPv6 string) is in a private/internal/special range.
- * Shared by the synchronous literal guard (`validateServerUrl`) and the DNS-resolution
- * guard (`createSsrfSafeLookup` / `assertHostnameResolvesSafe`), so a hostname that
- * *resolves* to an internal address is blocked, not just an internal IP literal.
+ * Hostnames the administrator has allowed to be private (`CKAN_PRIVATE_HOSTS`,
+ * comma-separated, exact match, e.g. "localhost,ckan.intra.example"). Off by default.
  */
-export function isBlockedIp(ip) {
-    const v = ip.toLowerCase().trim();
-    // IPv6 (any address containing a colon)
-    if (v.includes(':')) {
-        if (v === '::1' || v === '::')
-            return true; // loopback / unspecified
-        if (v.startsWith('fc') || v.startsWith('fd'))
-            return true; // fc00::/7 unique local
-        if (v.startsWith('fe80'))
-            return true; // fe80::/10 link-local
-        if (v.startsWith('::ffff:'))
-            return true; // IPv4-mapped IPv6
-        return false;
-    }
-    // IPv4 dotted-decimal
-    const m = v.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-    if (!m)
-        return false;
-    const o1 = Number(m[1]);
-    const o2 = Number(m[2]);
-    return (o1 === 0 || // 0.0.0.0/8
-        o1 === 10 || // 10.0.0.0/8 private
-        o1 === 127 || // 127.0.0.0/8 loopback
-        (o1 === 100 && o2 >= 64 && o2 <= 127) || // 100.64.0.0/10 shared
-        (o1 === 169 && o2 === 254) || // 169.254.0.0/16 link-local / cloud metadata
-        (o1 === 172 && o2 >= 16 && o2 <= 31) || // 172.16.0.0/12 private
-        (o1 === 192 && o2 === 168) || // 192.168.0.0/16 private
-        o1 === 255 // broadcast
-    );
+export function isPrivateHostAllowed(hostname) {
+    return isPrivateHostAllowedIn(hostname, ckanPrivateHosts());
 }
 /**
- * Validate that a server URL is safe to request (SSRF prevention).
- * Blocks non-HTTP/S protocols and private/internal IP *literals*.
- * Hostnames that resolve to internal IPs are blocked later, at connection time,
- * by the DNS-resolution guards (see `createSsrfSafeLookup` / `assertHostnameResolvesSafe`).
+ * Validate that a server URL is safe to request (SSRF prevention), with the
+ * `CKAN_ALLOWED_DOMAINS` and `CKAN_PRIVATE_HOSTS` settings. See safe-http.ts.
  */
 export function validateServerUrl(serverUrl) {
-    let parsed;
-    try {
-        parsed = new URL(serverUrl);
+    validateServerUrlWith(serverUrl, ckanUrlGuardSettings());
+}
+/**
+ * A redirect may enter a `CKAN_PRIVATE_HOSTS` host only from another listed host, so a
+ * public portal cannot answer with a 302 to e.g. `http://localhost:5003/` and have the
+ * server follow it. Other hops are checked by `validateServerUrl` as before.
+ */
+export function assertRedirectKeepsPrivateExemption(fromHostname, toUrl) {
+    assertRedirectKeepsPrivateExemptionWith(fromHostname, toUrl, ckanUrlGuardSettings());
+}
+/**
+ * The SSRF-safe DNS lookup (see safe-http.ts). With `allowPrivateHosts`, a
+ * `CKAN_PRIVATE_HOSTS` host may resolve to a private address; only the CKAN (axios)
+ * agents ask for it. The fetch dispatcher used by `sparql_query` does not, so it stays
+ * closed to private hosts at connect time.
+ */
+export function createSsrfSafeLookup(dnsModule, settings = {}) {
+    return createSsrfSafeLookupWith(dnsModule, settings, ckanPrivateHosts);
+}
+/**
+ * Fetch that re-validates every redirect hop (see safe-http.ts), with the CKAN settings.
+ * Used by `sparql_query` and the other tools that fetch a URL.
+ */
+export function safeFetch(url, init = {}, opts = {}) {
+    return safeFetchWith(url, init, { ...opts, urlGuard: ckanUrlGuardSettings });
+}
+let _safeAgents = null;
+/** Lazily build SSRF-safe http/https Agents (Node only). Returns null off Node/on failure. */
+function getSafeAgents() {
+    if (!_safeAgents) {
+        _safeAgents = createSafeAgents(ckanPrivateHosts);
     }
-    catch {
-        throw new Error(`Invalid URL: ${serverUrl}`);
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-        throw new Error(`Disallowed protocol "${parsed.protocol}". Only http and https are allowed.`);
-    }
-    const hostname = parsed.hostname.toLowerCase();
-    const BLOCKED_HOSTNAMES = new Set([
-        'localhost',
-        'ip6-localhost',
-        'ip6-loopback',
-    ]);
-    if (BLOCKED_HOSTNAMES.has(hostname)) {
-        throw new Error(`Access to "${hostname}" is not allowed.`);
-    }
-    // Block IPv4 private/special literals. WHATWG URL already normalizes integer/hex/
-    // octal/short IPv4 forms (e.g. 0x7f000001 → 127.0.0.1) to dotted-decimal here, so a
-    // single dotted-quad check covers all those encodings (GHSA-8hxx).
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(hostname) && isBlockedIp(hostname)) {
-        throw new Error(`Access to private/internal IP addresses is not allowed.`);
-    }
-    // Block IPv6 private/loopback literals (URL hostname keeps the brackets)
-    if (hostname.startsWith('[') && isBlockedIp(hostname.slice(1, -1))) {
-        throw new Error(`Access to private/internal IPv6 addresses is not allowed.`);
-    }
-    // Optional domain allowlist: CKAN_ALLOWED_DOMAINS=domain1.com,domain2.org
-    const rawAllowed = typeof process !== 'undefined' ? (process.env.CKAN_ALLOWED_DOMAINS ?? '') : '';
-    const allowedDomains = rawAllowed.split(',').map(s => s.trim()).filter(Boolean);
-    if (allowedDomains.length > 0 && !allowedDomains.includes(hostname)) {
-        throw new Error(`Domain "${hostname}" is not in the allowed list (CKAN_ALLOWED_DOMAINS).`);
-    }
+    return _safeAgents;
+}
+/**
+ * With the HTTP transport a `CKAN_PRIVATE_HOSTS` host is reachable by every client of
+ * the server. Say so at start, like the warning for `CKAN_HTTP_ALLOW_ALL`.
+ */
+export function warnIfPrivateHostsOverHttp() {
+    const raw = typeof process !== 'undefined' ? (process.env.CKAN_PRIVATE_HOSTS ?? '') : '';
+    const hosts = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (hosts.length === 0)
+        return;
+    console.error(`[SECURITY WARNING] CKAN_PRIVATE_HOSTS is set with the HTTP transport: ${hosts.join(', ')} ` +
+        'can be reached by every client of this server. List only hosts you want all clients to reach.');
 }
 /**
  * Refuse to run the network-exposed HTTP transport without a domain allowlist.
@@ -313,139 +107,200 @@ export function assertHttpAllowlistConfigured() {
         'Set CKAN_ALLOWED_DOMAINS="portal1.org,portal2.gov" to restrict which hosts can be queried,\n' +
         'or set CKAN_HTTP_ALLOW_ALL=true to explicitly run without restriction (NOT recommended when network-exposed).');
 }
-/**
- * Build a Node `lookup` function (for http/https Agents) that resolves the hostname,
- * rejects if ANY resolved address is private/internal, and pins the connection to the
- * validated address — closing the DNS-name SSRF bypass and DNS-rebinding (the IP the
- * socket connects to is exactly the one we validated, no second resolution).
- * Exported with an injectable dns module so it can be unit-tested without real DNS.
- */
-export function createSsrfSafeLookup(dnsModule) {
-    return function ssrfSafeLookup(hostname, options, callback) {
-        if (typeof options === 'function') {
-            callback = options;
-            options = {};
-        }
-        const family = options && typeof options === 'object' ? options.family : undefined;
-        dnsModule.lookup(hostname, { all: true, family: family || 0 }, (err, addresses) => {
-            if (err) {
-                callback(err);
-                return;
-            }
-            const list = Array.isArray(addresses) ? addresses : [addresses];
-            for (const a of list) {
-                if (isBlockedIp(a.address)) {
-                    callback(new Error(`Access to private/internal IP addresses is not allowed ` +
-                        `("${hostname}" resolves to ${a.address}).`));
-                    return;
-                }
-            }
-            if (options && options.all) {
-                callback(null, list);
-                return;
-            }
-            callback(null, list[0].address, list[0].family);
-        });
-    };
-}
-let _safeAgents = null;
-/** Lazily build SSRF-safe http/https Agents (Node only). Returns null off Node/on failure. */
-function getSafeAgents() {
-    if (!_safeAgents) {
-        _safeAgents = (async () => {
-            try {
-                // String-concatenated specifiers keep esbuild from bundling node builtins
-                // into the Cloudflare Workers build (mirrors loadZlib above).
-                const dnsMod = (await import("node:" + "dns"));
-                const httpMod = (await import("node:" + "http"));
-                const httpsMod = (await import("node:" + "https"));
-                const lookup = createSsrfSafeLookup(dnsMod);
-                return {
-                    httpAgent: new httpMod.Agent({ lookup }),
-                    httpsAgent: new httpsMod.Agent({ lookup }),
-                };
-            }
-            catch {
-                return null;
-            }
-        })();
+export class CkanApiError extends Error {
+    status;
+    action;
+    /** The portal the request went to, as the caller wrote it: lets the hint know its origin. */
+    serverUrl;
+    /** The reason CKAN itself gave, when the portal answered with a CKAN error body. */
+    ckanReason;
+    constructor(message, status, action, serverUrl, ckanReason) {
+        super(message);
+        this.name = 'CkanApiError';
+        this.status = status;
+        this.action = action;
+        this.serverUrl = serverUrl;
+        this.ckanReason = ckanReason;
     }
-    return _safeAgents;
 }
-let _dnsResolver = null;
-/** Test seam: override the DNS resolver used by `assertHostnameResolvesSafe`. */
-export function __setDnsResolverForTests(fn) {
-    _dnsResolver = fn;
-}
+const MAX_CKAN_REASON_LENGTH = 300;
+/** Error bodies larger than this are not read: a CKAN error is a few hundred bytes. */
+const MAX_ERROR_BODY_BYTES = 64 * 1024;
 /**
- * Resolve a hostname and throw if it maps to a private/internal IP.
- * Used by the fetch-based paths (e.g. sparql_query) that cannot attach a custom
- * lookup agent. No-op when DNS is unavailable (Cloudflare Workers — CF sandbox
- * already blocks internal addresses) or when resolution fails (request fails naturally).
+ * The reason CKAN gives for a failed action: `error.message`, or for a validation error
+ * (which has none) its fields, `query: column "x" does not exist`. One line, capped,
+ * with a notice of how many characters were omitted.
+ *
+ * Only a CKAN error body counts — an object with `success: false` and an `error` — so a
+ * firewall page or any other upstream content is never echoed (GHSA-6f9w).
  */
-export async function assertHostnameResolvesSafe(hostname) {
-    let lookup;
-    if (_dnsResolver) {
-        lookup = _dnsResolver;
+export function extractCkanErrorMessage(body) {
+    if (!body || typeof body !== 'object')
+        return null;
+    const { success, error } = body;
+    if (success !== false || error === undefined || error === null)
+        return null;
+    let text;
+    if (typeof error === 'string') {
+        text = error;
+    }
+    else if (typeof error === 'object') {
+        const fields = error;
+        if (typeof fields.message === 'string') {
+            text = fields.message;
+        }
+        else {
+            text = Object.entries(fields)
+                .filter(([key]) => key !== '__type')
+                .map(([key, value]) => `${key}: ${Array.isArray(value) ? value.join('; ') : typeof value === 'string' ? value : JSON.stringify(value)}`)
+                .join('; ');
+        }
     }
     else {
-        let dnsMod;
-        try {
-            dnsMod = await import("node:" + "dns");
-        }
-        catch {
-            // DNS module unavailable (Cloudflare Workers): the CF sandbox already blocks
-            // internal egress, so this guard is a no-op there.
-            return;
-        }
-        lookup = (h) => dnsMod.promises.lookup(h, { all: true });
+        return null;
     }
-    let addresses;
-    try {
-        addresses = await lookup(hostname);
+    text = text.replace(/\s+/g, ' ').trim();
+    if (!text)
+        return null;
+    if (text.length <= MAX_CKAN_REASON_LENGTH)
+        return text;
+    // Say what was cut: the full reason is only in the portal's own API answer.
+    return `${text.slice(0, MAX_CKAN_REASON_LENGTH)}… [${text.length - MAX_CKAN_REASON_LENGTH} more characters from the portal omitted]`;
+}
+/** Build the error for a non-2xx answer, quoting CKAN's own reason when it gave one. */
+function httpError(status, statusText, body, action, serverUrl) {
+    // Cloudflare answers these itself when it cannot reach the origin, so `fetch` does not
+    // throw and the status text is empty or "<none>" (#560). The portal was never reached.
+    if ((status >= 520 && status <= 527) || status === 530) {
+        return new CkanTransportError(`Network error: Cloudflare could not reach the portal (HTTP ${status})`, serverUrl);
     }
-    catch {
-        // Fail closed: if we cannot resolve the name, do NOT let the request proceed to a
-        // socket that would resolve it independently (TOCTOU / SSRF bypass).
-        throw new Error(`Cannot resolve "${hostname}" for SSRF validation (failing closed).`);
-    }
-    for (const a of addresses) {
-        if (isBlockedIp(a.address)) {
-            throw new Error(`Access to private/internal IP addresses is not allowed ` +
-                `("${hostname}" resolves to ${a.address}).`);
-        }
+    // CKAN answers an unknown action with a bare JSON string, translated up to the colon. Only
+    // the fact is kept and the name is ours: an arbitrary body is never reflected (GHSA-6f9w).
+    const reason = extractCkanErrorMessage(body)
+        ?? (typeof body === 'string' && body.endsWith(`Action name not known: ${action}`) ? `Action name not known: ${action}` : undefined);
+    return new CkanApiError(`CKAN API error (${status}): ${reason ?? (statusText || 'Unknown error')}`, status, action, serverUrl, reason);
+}
+/**
+ * A request that never reached CKAN: DNS, socket, or our own 30s timeout.
+ *
+ * Deliberately not a `CkanApiError`: nothing answered, so there is no status and no
+ * upstream message to quote. `formatCkanError` still turns it into a hint, because
+ * "Request timeout connecting to X" alone does not tell an LLM whether to retry.
+ */
+export class CkanTransportError extends Error {
+    /** The portal the request went to, as the caller wrote it. */
+    serverUrl;
+    constructor(message, serverUrl) {
+        super(message);
+        this.name = 'CkanTransportError';
+        this.serverUrl = serverUrl;
     }
 }
 /**
- * Fetch that does NOT blindly follow redirects: each hop's target is re-validated
- * with `validateServerUrl` + `assertHostnameResolvesSafe` before it is followed,
- * closing redirect-based SSRF (e.g. a public endpoint 302-ing to 169.254.169.254).
- * The caller is expected to have validated the initial URL already.
- * On Workers, `assertHostnameResolvesSafe` is a no-op (the CF sandbox blocks internal egress).
+ * The SSRF guards surface inside an `AxiosError` in two shapes: directly in `cause`
+ * (connection-time `lookup` refusals) or one level deeper, under axios' own
+ * `ERR_FR_REDIRECTION_FAILURE` wrap of the `beforeRedirect` throw (redirect hops).
+ * Return the guard error, or null when the failure came from the network itself.
  */
-export async function safeFetch(url, init = {}, opts = {}) {
-    const maxHops = opts.maxHops ?? 3;
-    let current = url;
-    for (let hop = 0;; hop++) {
-        const response = await fetch(current, { ...init, redirect: "manual" });
-        const status = response.status;
-        const location = response.headers.get("location");
-        const isRedirect = (status === 301 || status === 302 || status === 303 ||
-            status === 307 || status === 308) && !!location;
-        if (!isRedirect) {
-            return response;
+function unwrapSsrfGuardError(axiosError) {
+    if (axiosError.cause instanceof SsrfGuardError)
+        return axiosError.cause;
+    const redirected = axiosError.cause?.cause;
+    return redirected instanceof SsrfGuardError ? redirected : null;
+}
+export function formatCkanError(error, _toolName) {
+    if (error instanceof CkanTransportError) {
+        const migration = error.serverUrl ? getPortalMigration(error.serverUrl) : null;
+        if (migration) {
+            return `${error.message}\n→ ${migration.notice} See ${migration.docs_url}`;
         }
-        if (hop >= maxHops) {
-            throw new Error(`Too many redirects (>${maxHops})`);
-        }
-        const next = new URL(location, current).toString();
-        if (opts.httpsOnly && new URL(next).protocol !== "https:") {
-            throw new Error("Redirect to a non-HTTPS URL is not allowed");
-        }
-        validateServerUrl(next);
-        await assertHostnameResolvesSafe(new URL(next).hostname);
-        current = next;
+        // The request never arrived, so retrying is the first thing to try and the
+        // status tool is how the caller finds out whether the portal is up at all. Its
+        // own answer can be served from the cache for an hour (see `getTtlForAction`),
+        // which is a deliberate TTL rather than an oversight, so the hint says so
+        // instead of promising a live check.
+        return `${error.message}\n→ Portal unreachable. Retry later, or call \`ckan_status_show\` to check portal health (its answer can come from the cache for up to an hour).`;
     }
+    if (!(error instanceof CkanApiError)) {
+        return error instanceof Error ? error.message : String(error);
+    }
+    const { status, action, message, serverUrl } = error;
+    // A portal that left CKAN answers every CKAN request the same way — catalog.data.gov
+    // returns a bare 404 — so no status-based hint can be right for it. Say what happened
+    // and where the data went, whatever the status.
+    const migration = serverUrl ? getPortalMigration(serverUrl) : null;
+    if (migration) {
+        return `${message}\n→ ${migration.notice} See ${migration.docs_url}`;
+    }
+    // SQL access is optional in CKAN and many portals disable it, answering 404 or 400 on
+    // the endpoint itself. The resource_id is usually fine, so pointing at
+    // `ckan_package_show` sends the caller round a loop that ends on the same answer.
+    const noSqlEndpoint = '→ This portal does not expose the SQL endpoint (optional in CKAN, often disabled). Use `ckan_datastore_search` with `filters`/`sort` instead; the resource_id is probably fine.';
+    const actionUnknown = error.ckanReason === `Action name not known: ${action}`;
+    let hint = '';
+    if (status === 404) {
+        if (action === 'datastore_search_sql') {
+            hint = noSqlEndpoint;
+        }
+        else if (action.startsWith('datastore_search')) {
+            hint = '→ Get a valid resource_id first: call `ckan_package_show` on a dataset, then pick a resource where `datastore_active` is true.';
+        }
+        else if (action === 'package_show') {
+            hint = '→ Use `ckan_package_search` to find a valid dataset name or ID.';
+        }
+        else if (action === 'organization_show') {
+            hint = '→ Use `ckan_organization_list` or `ckan_organization_search` to discover valid organization names.';
+        }
+        else if (action === 'group_show') {
+            hint = '→ Use `ckan_group_list` or `ckan_group_search` to discover valid group names.';
+        }
+    }
+    else if (status === 400 && actionUnknown && action === 'datastore_search_sql') {
+        hint = noSqlEndpoint;
+    }
+    else if (status === 400 && actionUnknown && action === 'datastore_search') {
+        hint = '→ This portal has no DataStore, so its tables cannot be queried here. Download the resource through its URL instead (`ckan_package_show` lists them).';
+    }
+    else if (status === 400) {
+        if (action === 'datastore_search_sql') {
+            hint = '→ Invalid SQL syntax or unknown column — check column names with `ckan_datastore_search` before writing SQL.';
+        }
+        else if (action.startsWith('datastore_search')) {
+            hint = '→ Bad request — likely an invalid field name or filter syntax; check column names with a `SELECT *` query first.';
+        }
+    }
+    else if (status === 403) {
+        if (!error.ckanReason) {
+            // No CKAN body: a firewall or bot-protection page (data.forest.go.th answers
+            // "Just a moment...", gudang.lokadata.id "Permintaan Ditolak") refused the client.
+            hint = '→ The portal\'s firewall or bot protection refused the request (no CKAN answer). It is not a parameter problem and retrying will not help; the portal may be usable only from a browser.';
+        }
+        else if (action === 'datastore_search_sql') {
+            // CKAN allows a fixed list of SQL functions and no system tables.
+            hint = '→ This SQL uses something not permitted on this portal (CKAN accepts a limited list of functions and no system tables such as information_schema). Rewrite the query without it, or use `ckan_datastore_search`. For a type conversion write `"col"::float` instead of `CAST(...)`: the `::` operator is not a function call.';
+        }
+    }
+    else if (status === 409 && action === 'datastore_search_sql') {
+        hint = '→ The portal rejected the SQL (reason above). Check table and column names with `ckan_datastore_search` (limit 1), then fix the query.';
+    }
+    else if (status === 409 || status === 422) {
+        hint = '→ Portal rejected the request — parameters may conflict; simplify filters and retry.';
+    }
+    else if (status === 503 || status === 502 || status === 504) {
+        hint = '→ Portal temporarily unavailable — retry in a few seconds, or call `ckan_status_show` to check portal health (cached up to an hour).';
+    }
+    else if (status === 500) {
+        hint = '→ Portal internal error — try a different portal or retry later, and call `ckan_status_show` to check portal health (cached up to an hour).';
+    }
+    else if (status === undefined) {
+        hint = '→ The portal may not support this action, or the endpoint is unavailable.';
+    }
+    return hint ? `${message}\n${hint}` : message;
+}
+let _lastCacheHit = null;
+/** Returns whether the last makeCkanRequest call was served from cache. */
+export function getLastCacheHit() {
+    return _lastCacheHit;
 }
 function auditLog(serverUrl, action, params, cacheHit) {
     if (typeof process === 'undefined' || !process.versions?.node)
@@ -472,6 +327,18 @@ function auditLog(serverUrl, action, params, cacheHit) {
         process.stderr.write(JSON.stringify(entry) + '\n');
     }
     catch { /* ignore */ }
+}
+// Default identity: some WAFs (dati.anticorruzione.it) reject anything but a Chrome UA.
+const BROWSER_USER_AGENT = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// Fallback identity: Anubis challenges any UA naming Mozilla, and lets honest bots through.
+const HONEST_USER_AGENT = 'CKAN-MCP-Server/1.0';
+/**
+ * True when the body is an Anubis proof-of-work challenge page (https://anubis.techaro.lol/)
+ * instead of CKAN JSON. No fixed User-Agent satisfies both Anubis and Chrome-only WAFs
+ * (issue #7), so `makeCkanRequest` retries once with `HONEST_USER_AGENT` when it sees one.
+ */
+export function isAnubisChallenge(body) {
+    return typeof body === 'string' && body.includes('anubis_challenge');
 }
 /**
  * Make HTTP request to CKAN API
@@ -500,7 +367,7 @@ export async function makeCkanRequest(serverUrl, action, params = {}, opts = {})
     const ttl = getTtlForAction(action, cacheConfig.ttlDefault);
     const cache = cacheEnabled && ttl > 0 ? getCache() : null;
     const cacheKey = cache
-        ? await buildCacheKey(resolvedServerUrl, action, params)
+        ? await buildCacheKey(baseUrl, action, params)
         : "";
     if (cache) {
         const cached = await cache.get(cacheKey);
@@ -513,81 +380,154 @@ export async function makeCkanRequest(serverUrl, action, params = {}, opts = {})
     _lastCacheHit = false;
     const rateLimitConfig = getRateLimitConfig();
     const rateLimitEnabled = rateLimitConfig.enabled && opts.rateLimit !== false;
-    if (rateLimitEnabled) {
-        const hostname = new URL(resolvedServerUrl).hostname;
-        await getRateLimiter().acquire(hostname);
-    }
-    try {
-        let decodedData;
-        if (isNode) {
-            const safeAgents = await getSafeAgents();
-            const response = await axios.get(url, {
-                params,
-                timeout: 30000,
-                responseType: "arraybuffer",
-                maxRedirects: 5,
-                maxContentLength: MAX_RESPONSE_BYTES,
-                maxBodyLength: MAX_RESPONSE_BYTES,
-                ...(safeAgents
-                    ? { httpAgent: safeAgents.httpAgent, httpsAgent: safeAgents.httpsAgent }
-                    : {}),
-                headers: {
-                    Accept: 'application/json, text/plain, */*',
-                    'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    Connection: 'keep-alive',
-                    'Sec-CH-UA': '"Chromium";v="120", "Not?A_Brand";v="24", "Google Chrome";v="120"',
-                    'Sec-CH-UA-Mobile': '?0',
-                    'Sec-CH-UA-Platform': '"Linux"',
-                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                }
-            });
-            decodedData = await decodePossiblyCompressed(response.data, response.headers);
+    const acquireRateToken = async () => {
+        if (rateLimitEnabled) {
+            const hostname = new URL(resolvedServerUrl).hostname;
+            await getRateLimiter().acquire(hostname);
         }
-        else {
-            const searchParams = new URLSearchParams();
-            for (const [key, value] of Object.entries(params)) {
-                if (value === undefined || value === null) {
-                    continue;
-                }
-                searchParams.set(key, String(value));
-            }
-            const fetchUrl = searchParams.toString()
-                ? `${url}?${searchParams.toString()}`
-                : url;
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 30000);
-            let response;
-            try {
-                response = await fetch(fetchUrl, {
-                    method: "GET",
-                    signal: controller.signal,
+    };
+    await acquireRateToken();
+    try {
+        // One retry, only for Anubis: see isAnubisChallenge.
+        const fetchDecoded = async (honest) => {
+            if (isNode) {
+                const safeAgents = await getSafeAgents();
+                // The host the request is currently on, to tell where each redirect comes from.
+                let hopHostname = new URL(url).hostname;
+                const config = {
+                    timeout: 30000,
+                    responseType: "arraybuffer",
+                    maxRedirects: 5,
+                    // Re-validate every redirect hop: Node skips the agent's `lookup` for IP
+                    // literals, so a public host 302-ing to e.g. 169.254.169.254 would otherwise
+                    // be followed. Also enforces CKAN_ALLOWED_DOMAINS on redirect targets.
+                    beforeRedirect: (redirectOptions) => {
+                        assertRedirectKeepsPrivateExemption(hopHostname, redirectOptions.href);
+                        hopHostname = new URL(redirectOptions.href).hostname;
+                        validateServerUrl(redirectOptions.href);
+                    },
+                    // Never route through HTTP_PROXY/HTTPS_PROXY: a proxy would connect to the
+                    // target itself, bypassing the SSRF-safe lookup pinned in the agents below.
+                    proxy: false,
+                    maxContentLength: MAX_RESPONSE_BYTES,
+                    maxBodyLength: MAX_RESPONSE_BYTES,
+                    ...(safeAgents
+                        ? { httpAgent: safeAgents.httpAgent, httpsAgent: safeAgents.httpsAgent }
+                        : {}),
                     headers: {
-                        Accept: "application/json, text/plain, */*",
-                        "Accept-Encoding": "identity",
-                        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                        Accept: 'application/json, text/plain, */*',
+                        'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        Connection: 'keep-alive',
+                        ...(honest
+                            ? {}
+                            : {
+                                'Sec-CH-UA': '"Chromium";v="120", "Not?A_Brand";v="24", "Google Chrome";v="120"',
+                                'Sec-CH-UA-Mobile': '?0',
+                                'Sec-CH-UA-Platform': '"Linux"'
+                            }),
+                        'User-Agent': honest ? HONEST_USER_AGENT : BROWSER_USER_AGENT
                     }
-                });
+                };
+                const response = opts.post
+                    ? await axios.post(url, params, config)
+                    : await axios.get(url, { params, ...config });
+                return decodePossiblyCompressed(response.data, response.headers, MAX_DECOMPRESSED_BYTES);
             }
-            finally {
-                clearTimeout(timeoutId);
+            else {
+                const searchParams = new URLSearchParams();
+                for (const [key, value] of Object.entries(params)) {
+                    if (value === undefined || value === null) {
+                        continue;
+                    }
+                    searchParams.set(key, String(value));
+                }
+                const fetchUrl = !opts.post && searchParams.toString()
+                    ? `${url}?${searchParams.toString()}`
+                    : url;
+                // The timer runs until the body is read, not just the headers: a portal that
+                // sent headers and then stalled kept a Worker call open for 134 s
+                // (open.canada.ca, 2026-10-31).
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 30000);
+                const timeoutError = () => new CkanTransportError(`Request timeout connecting to ${serverUrl}`, serverUrl);
+                try {
+                    let response;
+                    try {
+                        // safeFetch re-validates each redirect hop (same guard as the axios branch)
+                        response = await safeFetch(fetchUrl, {
+                            method: opts.post ? "POST" : "GET",
+                            ...(opts.post ? { body: JSON.stringify(params) } : {}),
+                            signal: controller.signal,
+                            headers: {
+                                Accept: "application/json, text/plain, */*",
+                                "Accept-Encoding": "identity",
+                                ...(opts.post ? { "Content-Type": "application/json" } : {}),
+                                "User-Agent": honest ? HONEST_USER_AGENT : BROWSER_USER_AGENT
+                            }
+                        }, { maxHops: 5 });
+                    }
+                    catch (error) {
+                        // Workers has no axios, so this branch is the only place a fetch failure can be
+                        // classified: a bare `TypeError` reaches `formatCkanError` and the caller gets
+                        // no retry guidance. The SSRF guards throw `SsrfGuardError` with their own
+                        // message, and those keep it.
+                        if (controller.signal.aborted)
+                            throw timeoutError();
+                        if (error instanceof TypeError) {
+                            throw new CkanTransportError(`Network error: ${error.message}`, serverUrl);
+                        }
+                        throw error;
+                    }
+                    if (!response.ok) {
+                        // The body carries CKAN's reason (`Not authorized to call function NULLIF`);
+                        // the status text alone never said what to fix. Read it only when small.
+                        let body = null;
+                        const errorLength = Number(response.headers.get("content-length"));
+                        if (!(Number.isFinite(errorLength) && errorLength > MAX_ERROR_BODY_BYTES)) {
+                            const text = await readBoundedText(response, MAX_ERROR_BODY_BYTES);
+                            try {
+                                if (text !== null)
+                                    body = JSON.parse(text);
+                            }
+                            catch { /* not JSON: fall back to the status text */ }
+                        }
+                        throw httpError(response.status, response.statusText, body, action, serverUrl);
+                    }
+                    const declaredLength = Number(response.headers.get("content-length"));
+                    if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+                        throw new CkanApiError(`Response too large (${declaredLength} bytes)`, undefined, action, serverUrl);
+                    }
+                    let buffer;
+                    try {
+                        buffer = await response.arrayBuffer();
+                    }
+                    catch (error) {
+                        // Past the headers no guard can fire, so any failure here is the connection:
+                        // Workers reports a dropped one as a plain `Error("Network connection lost.")`.
+                        if (controller.signal.aborted)
+                            throw timeoutError();
+                        throw new CkanTransportError(`Network error: ${error instanceof Error ? error.message : String(error)}`, serverUrl);
+                    }
+                    if (buffer.byteLength > MAX_RESPONSE_BYTES) {
+                        throw new CkanApiError(`Response too large (${buffer.byteLength} bytes)`, undefined, action, serverUrl);
+                    }
+                    const headers = {};
+                    response.headers.forEach((headerValue, headerKey) => {
+                        headers[headerKey] = headerValue;
+                    });
+                    return decodePossiblyCompressed(buffer, headers, MAX_DECOMPRESSED_BYTES);
+                }
+                finally {
+                    clearTimeout(timeoutId);
+                }
             }
-            if (!response.ok) {
-                throw new CkanApiError(`CKAN API error (${response.status}): ${response.statusText}`, response.status, action);
-            }
-            const declaredLength = Number(response.headers.get("content-length"));
-            if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
-                throw new CkanApiError(`Response too large (${declaredLength} bytes)`, undefined, action);
-            }
-            const buffer = await response.arrayBuffer();
-            if (buffer.byteLength > MAX_RESPONSE_BYTES) {
-                throw new CkanApiError(`Response too large (${buffer.byteLength} bytes)`, undefined, action);
-            }
-            const headers = {};
-            response.headers.forEach((headerValue, headerKey) => {
-                headers[headerKey] = headerValue;
-            });
-            decodedData = await decodePossiblyCompressed(buffer, headers);
+        };
+        let decodedData = await fetchDecoded(false);
+        if (isAnubisChallenge(decodedData)) {
+            // The retry is a second upstream request: it pays its own rate token.
+            await acquireRateToken();
+            decodedData = await fetchDecoded(true);
         }
         if (decodedData && decodedData.success === true) {
             const result = decodedData.result;
@@ -616,7 +556,7 @@ export async function makeCkanRequest(serverUrl, action, params = {}, opts = {})
                 }
             }
             catch { /* ignore logging failures */ }
-            throw new CkanApiError(`CKAN API returned success=false for action "${action}".`, undefined, action);
+            throw new CkanApiError(`CKAN API returned success=false for action "${action}".`, undefined, action, serverUrl);
         }
     }
     catch (error) {
@@ -624,20 +564,34 @@ export async function makeCkanRequest(serverUrl, action, params = {}, opts = {})
             throw error;
         if (axios.isAxiosError(error)) {
             const axiosError = error;
+            const guardError = unwrapSsrfGuardError(axiosError);
+            if (guardError)
+                throw guardError;
+            // The SSRF guards refuse before any connection; axios surfaces the refusal
+            // directly in `cause` (connection-time `lookup`) or one level deeper, under
+            // its ERR_FR_REDIRECTION_FAILURE wrap of the `beforeRedirect` throw. The
+            // guard's verdict must keep its own message — wrapping it in the
+            // "Portal unreachable. Retry later" hint would tell the LLM to retry a
+            // destination that will never pass, which the fetch branch already avoids.
             if (axiosError.response) {
-                const status = axiosError.response.status;
-                const data = axiosError.response.data;
-                const errorMsg = data?.error?.message || data?.error || 'Unknown error';
-                throw new CkanApiError(`CKAN API error (${status}): ${errorMsg}`, status, action);
+                // With `responseType: "arraybuffer"` the error body is bytes, possibly compressed:
+                // read as an object it never had an `error`, and every 4xx said "Unknown error".
+                const { status, statusText, data, headers } = axiosError.response;
+                let body = null;
+                try {
+                    body = await decodePossiblyCompressed(data, headers, MAX_DECOMPRESSED_BYTES);
+                }
+                catch { /* undecodable body: fall back to the status text */ }
+                throw httpError(status, statusText, body, action, serverUrl);
             }
             else if (axiosError.code === 'ECONNABORTED') {
-                throw new Error(`Request timeout connecting to ${serverUrl}`);
+                throw new CkanTransportError(`Request timeout connecting to ${serverUrl}`, serverUrl);
             }
             else if (axiosError.code === 'ENOTFOUND') {
-                throw new Error(`Server not found: ${serverUrl}`);
+                throw new CkanTransportError(`Server not found: ${serverUrl}`, serverUrl);
             }
             else {
-                throw new Error(`Network error: ${axiosError.message}`);
+                throw new CkanTransportError(`Network error: ${axiosError.message}`, serverUrl);
             }
         }
         throw error;

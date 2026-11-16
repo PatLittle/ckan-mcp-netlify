@@ -2,16 +2,50 @@
  * Portal Discovery tool — finds CKAN portals via datashades.info registry
  */
 import { z } from "zod";
-import axios from "axios";
 import { truncateText, cappedStructured, addDemoFooter } from "../utils/formatting.js";
-import { formatCkanError } from "../utils/http.js";
+import { formatCkanError, safeFetch } from "../utils/http.js";
+import { getCache, getCacheConfig } from "../utils/cache.js";
 const DATASHADES_URL = "https://datashades.info/api/portal/list";
+// The registry is 22 MB and every call downloaded it: 5 s median on the Worker
+// (telemetry 2026-10-04 to 2026-11-04). Filters change per call, the list rarely does,
+// so the active portals are cached, reduced to the fields this tool reads: 945
+// portals weigh ~129 KB, under the default per-entry cap.
+const REGISTRY_CACHE_KEY = "datashades-portal-list-v1";
+const REGISTRY_TTL_SECONDS = 6 * 3600;
+function slimPortal(p) {
+    return {
+        Href: p.Href,
+        SiteInfo: { site_title: p.SiteInfo?.site_title, locale_default: p.SiteInfo?.locale_default },
+        Coordinates: { country_name: p.Coordinates?.country_name },
+        Version: p.Version,
+        Plugins: (p.Plugins || []).includes("datastore") ? ["datastore"] : [],
+        DatasetsNumber: p.DatasetsNumber,
+        OrgNumber: p.OrgNumber,
+        status: p.status
+    };
+}
+// fetch, not axios: axios's fetch adapter breaks on Workers ("'cache' field ... not implemented")
 async function fetchPortals() {
-    const resp = await axios.get(DATASHADES_URL, {
-        timeout: 15000,
-        headers: { "User-Agent": "CKAN-MCP-Server/1.0" }
-    });
-    return resp.data.portals;
+    const config = getCacheConfig();
+    const cache = config.enabled ? getCache() : null;
+    if (cache) {
+        const cached = await cache.get(REGISTRY_CACHE_KEY);
+        if (Array.isArray(cached))
+            return cached;
+    }
+    const resp = await safeFetch(DATASHADES_URL, {
+        headers: { "User-Agent": "CKAN-MCP-Server/1.0" },
+        signal: AbortSignal.timeout(15000)
+    }, { httpsOnly: true });
+    if (!resp.ok) {
+        throw new Error(`datashades.info returned ${resp.status} ${resp.statusText}`);
+    }
+    const data = await resp.json();
+    const portals = data.portals.filter(p => p.status === "active" && p.Href).map(slimPortal);
+    if (cache && JSON.stringify(portals).length <= config.maxEntryBytes) {
+        await cache.set(REGISTRY_CACHE_KEY, portals, REGISTRY_TTL_SECONDS);
+    }
+    return portals;
 }
 function deduplicateByHostname(portals) {
     const seen = new Map();
@@ -30,10 +64,11 @@ function deduplicateByHostname(portals) {
 function filterPortals(portals, params) {
     const filtered = portals
         .filter(p => p.status === "active" && p.Href)
-        .filter(p => !params.country || p.Coordinates.country_name.toLowerCase().includes(params.country.toLowerCase()))
-        .filter(p => !params.query || p.SiteInfo.site_title.toLowerCase().includes(params.query.toLowerCase()))
+        // The registry has active portals with null fields (locale_default on 3 of 945, 2026-11-15)
+        .filter(p => !params.country || (p.Coordinates?.country_name ?? "").toLowerCase().includes(params.country.toLowerCase()))
+        .filter(p => !params.query || (p.SiteInfo?.site_title ?? "").toLowerCase().includes(params.query.toLowerCase()))
         .filter(p => params.min_datasets === undefined || p.DatasetsNumber >= params.min_datasets)
-        .filter(p => !params.language || p.SiteInfo.locale_default.toLowerCase().startsWith(params.language.toLowerCase()))
+        .filter(p => !params.language || (p.SiteInfo?.locale_default ?? "").toLowerCase().startsWith(params.language.toLowerCase()))
         .filter(p => !params.has_datastore || (p.Plugins || []).includes("datastore"));
     return deduplicateByHostname(filtered)
         .sort((a, b) => b.DatasetsNumber - a.DatasetsNumber)
@@ -42,7 +77,7 @@ function filterPortals(portals, params) {
 function formatMarkdown(portals, total, limit) {
     if (portals.length === 0)
         return "No CKAN portals found matching the given filters.";
-    const rows = portals.map(p => `| [${p.SiteInfo.site_title || p.Href}](${p.Href}) | ${p.Coordinates.country_name} | ${p.Version} | ${p.DatasetsNumber.toLocaleString()} | ${p.SiteInfo.locale_default} | ${(p.Plugins || []).includes("datastore") ? "✅" : "❌"} |`).join("\n");
+    const rows = portals.map(p => `| [${p.SiteInfo.site_title || p.Href}](${p.Href}) | ${p.Coordinates.country_name} | ${p.Version} | ${p.DatasetsNumber.toLocaleString()} | ${p.SiteInfo.locale_default ?? ""} | ${(p.Plugins || []).includes("datastore") ? "✅" : "❌"} |`).join("\n");
     return `# CKAN Portals
 
 **Source**: [datashades.info](https://datashades.info/portals) — live registry of ${total} active portals
