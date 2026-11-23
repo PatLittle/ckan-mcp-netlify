@@ -2,16 +2,91 @@
  * Portal Discovery tool — finds CKAN portals via datashades.info registry
  */
 import { z } from "zod";
-import axios from "axios";
-import { truncateText, cappedStructured, addDemoFooter } from "../utils/formatting.js";
-import { formatCkanError } from "../utils/http.js";
+import { truncateText, cappedStructured, addDemoFooter, jsonToolResult, formatError } from "../utils/formatting.js";
+import { ResponseFormat, ResponseFormatSchema } from "../types.js";
+import { formatCkanError, safeFetch } from "../utils/http.js";
+import { getCache, getCacheConfig } from "../utils/cache.js";
 const DATASHADES_URL = "https://datashades.info/api/portal/list";
+// The registry is 22 MB and every call downloaded it: 5 s median on the Worker
+// (telemetry 2026-10-04 to 2026-11-04). Filters change per call, the list rarely does,
+// so the active portals are cached, reduced to the fields this tool reads: 945
+// portals weigh ~129 KB, under the default per-entry cap.
+const REGISTRY_CACHE_KEY = "datashades-portal-list-v1";
+const REGISTRY_TTL_SECONDS = 6 * 3600;
+const REGISTRY_LAST_GOOD_KEY = "datashades-portal-list-last-good-v1";
+const REGISTRY_LAST_GOOD_TTL_SECONDS = 7 * 24 * 3600;
+let inflightFetch = null;
+function slimPortal(p) {
+    return {
+        Href: p.Href,
+        SiteInfo: { site_title: p.SiteInfo?.site_title, locale_default: p.SiteInfo?.locale_default },
+        Coordinates: { country_name: p.Coordinates?.country_name },
+        Version: p.Version,
+        Plugins: (p.Plugins || []).includes("datastore") ? ["datastore"] : [],
+        DatasetsNumber: p.DatasetsNumber,
+        OrgNumber: p.OrgNumber,
+        status: p.status
+    };
+}
+async function refreshPortals() {
+    const resp = await safeFetch(DATASHADES_URL, {
+        headers: { "User-Agent": "CKAN-MCP-Server/1.0" },
+        signal: AbortSignal.timeout(15000)
+    }, { httpsOnly: true });
+    if (!resp.ok) {
+        throw new Error(`datashades.info returned ${resp.status} ${resp.statusText}`);
+    }
+    const data = await resp.json();
+    // A 200 without a usable list (maintenance page, partial body) must not overwrite
+    // the last good copy: throw so the caller falls back to it.
+    if (!Array.isArray(data?.portals)) {
+        throw new Error("datashades.info returned no portal list");
+    }
+    const portals = data.portals.filter(p => p && p.status === "active" && p.Href).map(slimPortal);
+    if (portals.length === 0) {
+        throw new Error("datashades.info returned no active portals");
+    }
+    const config = getCacheConfig();
+    const cache = config.enabled ? getCache() : null;
+    const lastGood = {
+        fetchedAt: new Date(Date.now()).toISOString().slice(0, 10),
+        portals
+    };
+    if (cache && JSON.stringify(lastGood).length <= config.maxEntryBytes) {
+        await Promise.all([
+            cache.set(REGISTRY_CACHE_KEY, portals, REGISTRY_TTL_SECONDS),
+            cache.set(REGISTRY_LAST_GOOD_KEY, lastGood, REGISTRY_LAST_GOOD_TTL_SECONDS)
+        ]);
+    }
+    return portals;
+}
+// fetch, not axios: axios's fetch adapter breaks on Workers ("'cache' field ... not implemented")
 async function fetchPortals() {
-    const resp = await axios.get(DATASHADES_URL, {
-        timeout: 15000,
-        headers: { "User-Agent": "CKAN-MCP-Server/1.0" }
-    });
-    return resp.data.portals;
+    const config = getCacheConfig();
+    const cache = config.enabled ? getCache() : null;
+    if (cache) {
+        const cached = await cache.get(REGISTRY_CACHE_KEY);
+        if (Array.isArray(cached))
+            return { portals: cached };
+    }
+    if (!inflightFetch) {
+        inflightFetch = refreshPortals().finally(() => {
+            inflightFetch = null;
+        });
+    }
+    try {
+        const portals = await inflightFetch;
+        return { portals };
+    }
+    catch (error) {
+        if (cache) {
+            const lastGood = await cache.get(REGISTRY_LAST_GOOD_KEY);
+            if (lastGood && Array.isArray(lastGood.portals) && typeof lastGood.fetchedAt === "string") {
+                return { portals: lastGood.portals, staleFrom: lastGood.fetchedAt };
+            }
+        }
+        throw error;
+    }
 }
 function deduplicateByHostname(portals) {
     const seen = new Map();
@@ -30,22 +105,27 @@ function deduplicateByHostname(portals) {
 function filterPortals(portals, params) {
     const filtered = portals
         .filter(p => p.status === "active" && p.Href)
-        .filter(p => !params.country || p.Coordinates.country_name.toLowerCase().includes(params.country.toLowerCase()))
-        .filter(p => !params.query || p.SiteInfo.site_title.toLowerCase().includes(params.query.toLowerCase()))
+        // The registry has active portals with null fields (locale_default on 3 of 945, 2026-11-15)
+        .filter(p => !params.country || (p.Coordinates?.country_name ?? "").toLowerCase().includes(params.country.toLowerCase()))
+        .filter(p => !params.query || (p.SiteInfo?.site_title ?? "").toLowerCase().includes(params.query.toLowerCase()))
         .filter(p => params.min_datasets === undefined || p.DatasetsNumber >= params.min_datasets)
-        .filter(p => !params.language || p.SiteInfo.locale_default.toLowerCase().startsWith(params.language.toLowerCase()))
+        .filter(p => !params.language || (p.SiteInfo?.locale_default ?? "").toLowerCase().startsWith(params.language.toLowerCase()))
         .filter(p => !params.has_datastore || (p.Plugins || []).includes("datastore"));
     return deduplicateByHostname(filtered)
         .sort((a, b) => b.DatasetsNumber - a.DatasetsNumber)
         .slice(0, params.limit);
 }
-function formatMarkdown(portals, total, limit) {
+function formatMarkdown(portals, total, limit, staleFrom) {
+    const staleSuffix = staleFrom ? `\n\n(portal list from ${staleFrom}, datashades.info did not answer)` : "";
     if (portals.length === 0)
-        return "No CKAN portals found matching the given filters.";
-    const rows = portals.map(p => `| [${p.SiteInfo.site_title || p.Href}](${p.Href}) | ${p.Coordinates.country_name} | ${p.Version} | ${p.DatasetsNumber.toLocaleString()} | ${p.SiteInfo.locale_default} | ${(p.Plugins || []).includes("datastore") ? "✅" : "❌"} |`).join("\n");
+        return `No CKAN portals found matching the given filters.${staleSuffix}`;
+    const rows = portals.map(p => `| [${p.SiteInfo.site_title || p.Href}](${p.Href}) | ${p.Coordinates.country_name} | ${p.Version} | ${(p.DatasetsNumber ?? 0).toLocaleString()} | ${p.SiteInfo.locale_default ?? ""} | ${(p.Plugins || []).includes("datastore") ? "✅" : "❌"} |`).join("\n");
+    const sourceLine = staleFrom
+        ? `**Source**: [datashades.info](https://datashades.info/portals) — portal list from ${staleFrom}, datashades.info did not answer (${total} active portals)`
+        : `**Source**: [datashades.info](https://datashades.info/portals) — live registry of ${total} active portals`;
     return `# CKAN Portals
 
-**Source**: [datashades.info](https://datashades.info/portals) — live registry of ${total} active portals
+${sourceLine}
 **Showing**: ${portals.length} of ${total} (filtered, sorted by dataset count)
 
 | Portal | Country | CKAN | Datasets | Locale | DataStore |
@@ -74,6 +154,7 @@ Args:
   - language (string): Portal default locale code (e.g. "it", "en", "pt_BR", "fr")
   - has_datastore (boolean): If true, return only portals with DataStore enabled (supports SQL queries)
   - limit (number): Max results to return (default 10, max 50)
+  - response_format ('markdown' | 'json'): Output format (default: 'markdown')
 
 Returns:
   Ranked list of matching portals with URL, country, CKAN version, dataset count, and DataStore status.
@@ -85,7 +166,8 @@ Typical workflow: ckan_find_portals (discover portal URL) → ckan_status_show (
             min_datasets: z.coerce.number().int().min(0).optional().describe("Minimum number of datasets"),
             language: z.string().optional().describe("Portal default locale code (e.g. 'it', 'en', 'pt_BR')"),
             has_datastore: z.boolean().optional().describe("If true, return only portals with DataStore plugin (required for SQL queries)"),
-            limit: z.coerce.number().int().min(1).max(50).optional().default(10).describe("Max results (default 10, max 50)")
+            limit: z.coerce.number().int().min(1).max(50).optional().default(10).describe("Max results (default 10, max 50)"),
+            response_format: ResponseFormatSchema
         }).strict(),
         annotations: {
             readOnlyHint: true,
@@ -95,7 +177,7 @@ Typical workflow: ckan_find_portals (discover portal URL) → ckan_status_show (
         }
     }, async (params) => {
         try {
-            const all = await fetchPortals();
+            const { portals: all, staleFrom } = await fetchPortals();
             const active = all.filter(p => p.status === "active");
             const results = filterPortals(all, {
                 country: params.country,
@@ -105,26 +187,34 @@ Typical workflow: ckan_find_portals (discover portal URL) → ckan_status_show (
                 has_datastore: params.has_datastore,
                 limit: params.limit
             });
-            const markdown = formatMarkdown(results, active.length, params.limit);
+            const portals = results.map(p => ({
+                url: p.Href,
+                title: p.SiteInfo.site_title,
+                country: p.Coordinates.country_name,
+                version: p.Version,
+                datasets: p.DatasetsNumber,
+                locale: p.SiteInfo.locale_default,
+                has_datastore: (p.Plugins || []).includes("datastore")
+            }));
+            const payload = { portals };
+            if (staleFrom) {
+                payload.note = `portal list from ${staleFrom}, datashades.info did not answer`;
+            }
+            if (params.response_format === ResponseFormat.JSON) {
+                return jsonToolResult(payload);
+            }
+            const markdown = formatMarkdown(results, active.length, params.limit, staleFrom);
             // Text channel is Markdown, so cap the structured payload on its own. The 50-result
             // limit bounds the number of entries, not their size: titles and URLs come from
             // datashades.info and have no length bound (#39).
             return {
                 content: [{ type: "text", text: truncateText(addDemoFooter(markdown)) }],
-                structuredContent: cappedStructured({ portals: results.map(p => ({
-                        url: p.Href,
-                        title: p.SiteInfo.site_title,
-                        country: p.Coordinates.country_name,
-                        version: p.Version,
-                        datasets: p.DatasetsNumber,
-                        locale: p.SiteInfo.locale_default,
-                        has_datastore: (p.Plugins || []).includes("datastore")
-                    })) })
+                structuredContent: cappedStructured(payload)
             };
         }
         catch (error) {
             return {
-                content: [{ type: "text", text: `Could not fetch portal list from datashades.info:\n${formatCkanError(error, "ckan_find_portals")}` }],
+                content: [{ type: "text", text: formatError(`Could not fetch portal list from datashades.info:\n${formatCkanError(error, "ckan_find_portals")}`, params.response_format === ResponseFormat.JSON) }],
                 isError: true
             };
         }

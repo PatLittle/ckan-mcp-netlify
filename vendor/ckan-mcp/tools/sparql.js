@@ -8,12 +8,17 @@ import { validateServerUrl, assertHostnameResolvesSafe, safeFetch } from "../uti
 import { truncateText, formatError, jsonToolResult } from "../utils/formatting.js";
 const DEFAULT_LIMIT = 25;
 const MAX_LIMIT = 1000;
+const TIMEOUT_MS = 15000;
+const ERROR_HEAD_BYTES = 4 * 1024;
+const MAX_REASON_LENGTH = 300;
 /**
  * Validates that the query is a SELECT statement.
  * Throws if it contains write operations or no SELECT keyword.
  */
 export function validateSelectQuery(query) {
-    const stripped = query.replace(/#[^\n]*/g, "");
+    // A `#` starts a comment only outside IRIs and string literals: namespace IRIs such as
+    // rdf-schema# end in one, and a PREFIX on the same line as SELECT must not hide it.
+    const stripped = query.replace(/<[^<>"{}|^`\\\s]*>|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'|#[^\n]*/g, match => (match.startsWith("#") ? "" : match));
     if (!/\bSELECT\b/i.test(stripped)) {
         throw new Error("Only SELECT queries are supported (not CONSTRUCT, ASK, DESCRIBE, or write operations).");
     }
@@ -41,9 +46,9 @@ export async function querySparqlEndpoint(endpointUrl, query) {
         "User-Agent": "Mozilla/5.0 (compatible; CKAN-MCP-Server/1.0)"
     };
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 15000);
-    let response;
+    const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
     try {
+        let response;
         if (method === "GET") {
             const getUrl = new URL(endpointUrl);
             getUrl.searchParams.set("query", query);
@@ -71,14 +76,82 @@ export async function querySparqlEndpoint(endpointUrl, query) {
                 }, { httpsOnly: true });
             }
         }
+        // The deadline covers the body too: an endpoint can send its headers and then stall.
+        if (!response.ok) {
+            const reason = await readErrorReason(response, controller.signal);
+            throw new Error(`SPARQL endpoint error (${response.status}): ${response.statusText}${reason ? `: ${reason}` : ""}`);
+        }
+        return (await response.json());
+    }
+    catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+            throw new Error(`The endpoint did not answer within ${TIMEOUT_MS / 1000} seconds (timeout). Simplify the query (fewer VALUES, a LIMIT, no OPTIONAL over large sets) or retry later.`, { cause: error });
+        }
+        throw error;
     }
     finally {
         clearTimeout(timeoutId);
     }
-    if (!response.ok) {
-        throw new Error(`SPARQL endpoint error (${response.status}): ${response.statusText}`);
+}
+/**
+ * The first `maxBytes` of a body; the rest is never downloaded. Stops with what it has
+ * when `signal` aborts.
+ */
+async function readHead(response, maxBytes, signal) {
+    const reader = response.body?.getReader();
+    if (!reader)
+        return "";
+    const stop = () => { reader.cancel().catch(() => undefined); };
+    if (signal.aborted)
+        stop();
+    signal.addEventListener("abort", stop, { once: true });
+    const decoder = new TextDecoder();
+    let text = "";
+    let total = 0;
+    try {
+        while (total < maxBytes) {
+            const { done, value } = await reader.read();
+            if (done)
+                break;
+            const chunk = value.subarray(0, maxBytes - total);
+            total += chunk.byteLength;
+            text += decoder.decode(chunk, { stream: true });
+        }
     }
-    return response.json();
+    finally {
+        signal.removeEventListener("abort", stop);
+        await reader.cancel().catch(() => undefined);
+    }
+    return text;
+}
+/**
+ * The endpoint's own explanation of a failed query, as one short line. Wikidata answers
+ * a parse error with an echo of the (possibly multiline) query and a Java stack trace;
+ * Virtuoso puts the message first. Without it the caller sees only "Bad Request" and retries blind.
+ * HTML pages (gateways, proxies) carry nothing useful and are left out.
+ */
+async function readErrorReason(response, signal) {
+    try {
+        if (/html/i.test(response.headers?.get?.("content-type") ?? ""))
+            return "";
+        const text = await readHead(response, ERROR_HEAD_BYTES, signal);
+        if (!text || /^\s*</.test(text))
+            return "";
+        const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        // Wikidata echoes the query first, one line per query line, then the exception.
+        const line = lines[0]?.startsWith("SPARQL-QUERY:")
+            ? lines.find(l => /^[\w$.]+(?:Exception|Error): /.test(l))
+            : lines[0];
+        if (!line)
+            return "";
+        const reason = line
+            .replace(/^(?:[\w$.]+(?:Exception|Error): )+/, "")
+            .replace(/[\u0000-\u001f\u007f]/g, "");
+        return reason.length > MAX_REASON_LENGTH ? `${reason.slice(0, MAX_REASON_LENGTH)}…` : reason;
+    }
+    catch {
+        return "";
+    }
 }
 export function formatSparqlMarkdown(data, endpointUrl) {
     const vars = data.head.vars;

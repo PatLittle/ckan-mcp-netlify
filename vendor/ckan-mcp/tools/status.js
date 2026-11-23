@@ -2,9 +2,9 @@
  * CKAN Status tools
  */
 import { z } from "zod";
-import { makeCkanRequest } from "../utils/http.js";
+import { makeCkanRequest, formatCkanError, CkanApiError, CkanTransportError } from "../utils/http.js";
 import { truncateText, cappedStructured, addDemoFooter } from "../utils/formatting.js";
-import { getPortalSparqlConfig, getPortalHvdConfig } from "../utils/portal-config.js";
+import { getPortalSparqlConfig, getPortalHvdConfig, getPortalMigration } from "../utils/portal-config.js";
 export function formatStatusMarkdown(result, serverUrl, hvdCount) {
     const sparql = getPortalSparqlConfig(serverUrl);
     const sparqlLine = sparql ? `**SPARQL Endpoint**: ${sparql.endpoint_url}\n` : "";
@@ -68,11 +68,23 @@ Typical workflow: ckan_status_show (verify server is up) → ckan_package_search
             };
         }
         catch (error) {
+            // A portal that left CKAN is neither offline nor invalid: the migration notice
+            // is the whole diagnosis, and the usual prefix would contradict it.
+            const migrated = (error instanceof CkanApiError || error instanceof CkanTransportError) &&
+                error.serverUrl && getPortalMigration(error.serverUrl);
+            if (migrated) {
+                return { content: [{ type: "text", text: formatCkanError(error, "ckan_status_show") }], isError: true };
+            }
+            // The generic hints send the caller to `ckan_status_show`, which is this tool. Most
+            // failures here are a site that is up but is not the CKAN API (open.ottawa.ca is an
+            // ArcGIS Hub, data.europa.eu/data answers 404), so say that and point at discovery.
+            const detail = error instanceof CkanApiError || error instanceof CkanTransportError
+                ? `${error.message}\n→ No CKAN API answered at this address. The site may be up but not run CKAN, ` +
+                    `or keep its CKAN API on another host. Use \`ckan_find_portals\` to look up the portal's CKAN API URL; ` +
+                    `retry later only if this address usually works.`
+                : formatCkanError(error, "ckan_status_show");
             return {
-                content: [{
-                        type: "text",
-                        text: `Server appears to be offline or not a valid CKAN instance:\n${error instanceof Error ? error.message : String(error)}`
-                    }],
+                content: [{ type: "text", text: `Server appears to be offline or not a valid CKAN instance:\n${detail}` }],
                 isError: true
             };
         }
