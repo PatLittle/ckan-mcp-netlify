@@ -1,8 +1,8 @@
 {
   "repo": "https://github.com/PatLittle/pibs",
-  "commit": "4904f5030eb8187dfae65d1a1d4b764fc4e97a86",
-  "date": "2026-11-01 14:39:37 +0000",
+  "commit": "2f584976b00da405c9d5953f5a14d82b560e1de4",
+  "date": "2026-11-22 15:49:24 +0000",
   "tool_api_version": "0.2.0",
   "release_stage": "beta",
-  "contract_version": "2026-09-28.6"
+  "contract_version": "2026-11-12.6"
 }
