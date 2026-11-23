@@ -19,6 +19,18 @@ export function getPortalConfig(serverUrl) {
     });
     return portal || null;
 }
+/**
+ * Looked up by hostname, not by exact URL: a host that left CKAN has left it for
+ * every path, port and spelling, and the request router already resolves configured
+ * portals by hostname — `https://CATALOG.DATA.GOV:443/` must get the same answer.
+ */
+export function getPortalMigration(serverUrl) {
+    const hostname = extractHostname(serverUrl);
+    if (!hostname)
+        return null;
+    const portal = portalsConfig.portals.find((p) => [p.api_url, ...(p.api_url_aliases || [])].some((url) => extractHostname(url) === hostname));
+    return portal?.migrated ?? null;
+}
 export function getPortalSearchConfig(serverUrl) {
     const portal = getPortalConfig(serverUrl);
     const defaults = portalsConfig.defaults?.search || {};
@@ -59,6 +71,22 @@ export function getPortalSparqlConfig(serverUrl) {
 export function getPortalApiPath(serverUrl) {
     const portal = getPortalConfig(serverUrl);
     return portal?.api_path || '/api/3/action';
+}
+/**
+ * The action endpoint base a request to `serverUrl` really goes to: configured
+ * portals are routed by hostname, as `makeCkanRequest` does, so a link built from
+ * the caller's spelling can miss the API (data.gov.au answers only under /data).
+ */
+export function getPortalActionBase(serverUrl) {
+    let base = serverUrl;
+    try {
+        base = getPortalApiUrlForHostname(new URL(serverUrl).hostname) ?? serverUrl;
+    }
+    catch {
+        // Keep the provided URL if parsing fails
+    }
+    base = base.replace(/\/$/, '');
+    return `${base}${getPortalApiPath(base)}`;
 }
 export function requiresMultilingualNormalization(serverUrl) {
     const portal = getPortalConfig(serverUrl);
